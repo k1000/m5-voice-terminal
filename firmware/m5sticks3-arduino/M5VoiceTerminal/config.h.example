@@ -1,0 +1,5 @@
+#pragma once
+#define WIFI_SSID "your-wifi-ssid"
+#define WIFI_PASSWORD "replace-me"
+#define VOICE_URL "http://your-server-ip:8010/voice-command"
+#define DEVICE_ID "m5sticks3-01"

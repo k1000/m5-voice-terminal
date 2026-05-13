@@ -1,0 +1,11 @@
+name,triggers,read,docs,skip
+Important discovered roots,route map|routes|project structure,docs|scripts,README.md|docs/stt-review.md,node_modules|.next|dist|coverage
+Project orientation and agent rules,architecture|agent|rules|conventions|project|overview|where is|how do,,README.md,node_modules|.next|dist|coverage
+ClearView customer app,clearview|customer|account|onboarding|client|wizard|broker agreement|settings,,,apps/clearview/.next|apps/clearview/node_modules
+ClearOps staff app,clearops|staff|admin|operations|dashboard|worker ui|monitoring,,,apps/clearops/.next|apps/clearops/node_modules
+Workers and scheduler,worker|workers|scheduler|queue|pgboss|cron|orchestration|clearworkers|mpg worker,,,apps/workers/dist|apps/workers/node_modules
+Domain packages,domain|service|validator|business logic|package,,,packages/domains/**/node_modules
+Database schema and migrations,database|db|schema|drizzle|migration|sql|table|column|caps.id|zoho,packages/shared/src/db,AGENTS.md,packages/shared/src/db/drizzle/migrations/meta
+Legacy MPG reference only,mpg|legacy|reference|port|parity|prototype,,,mpg/node_modules|mpg/.next
+Testing and quality gates,test|vitest|coverage|typecheck|lint|quality|failing,scripts,,coverage|node_modules|.next
+Automation scripts and reusable commands,automation|script|scripts|repeat|repeated|command|automate|helper|check|audit,scripts|requirements.txt|scripts/agent_inbox.py|scripts/agent_worker.py|scripts/arduino_upload.sh|scripts/benchmark_stt.py|scripts/make_stt_samples.sh|scripts/upload.sh|scripts/upload_voice_sample.py,,node_modules|.next|dist|coverage

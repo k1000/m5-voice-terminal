@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+.DS_Store
+
+# Local/private Pi/Sherpa state
+.pi/
+.pi-memory/
+
+# Device/network secrets
+stick/config.py
+firmware/**/config.h
+
+# Runtime state and generated media
+/data/*.json
+/data/audio/
+/data/images/
