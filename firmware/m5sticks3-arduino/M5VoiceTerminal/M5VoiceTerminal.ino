@@ -49,7 +49,9 @@ static void drawStatus(const char *title, const String &line = "") {
 
 static const uint16_t *faceDataFor(const String &state) {
   if (state == "recording") return WOLF_FACE_RECORDING;
-  if (state == "waiting") return WOLF_FACE_WAITING;
+  if (state == "waiting-left") return WOLF_FACE_WAITING_LEFT;
+  if (state == "waiting-right") return WOLF_FACE_WAITING_RIGHT;
+  if (state == "waiting") return WOLF_FACE_WAITING_RIGHT;
   if (state == "happy") return WOLF_FACE_HAPPY;
   if (state == "sad") return WOLF_FACE_SAD;
   return WOLF_FACE_NEUTRAL;
@@ -73,7 +75,7 @@ static void drawReady() {
   drawFaceImage("neutral");
   M5.Display.setTextSize(2);
   M5.Display.setTextColor(WHITE, BLACK);
-  drawWrapped("Ready\nHold BtnA", 4, 142, 10, 18);
+  drawWrapped("Hit it", 4, 142, 10, 18);
 }
 
 static void drawSentimentResponse(const String &sentimentInput, const String &line = "") {
@@ -180,22 +182,24 @@ static bool pollJobResult(const String &jobId);
 static String postTextCommand(const String &text);
 
 static void drawOptions(JsonArray options, int selected) {
-  M5.Display.fillRect(0, 170, M5.Display.width(), 70, BLACK);
+  M5.Display.fillRect(0, 158, M5.Display.width(), 82, BLACK);
   M5.Display.setTextSize(1);
   M5.Display.setTextColor(WHITE, BLACK);
-  M5.Display.setCursor(4, 170);
-  M5.Display.println("BtnB select BtnA OK");
+  M5.Display.setCursor(4, 158);
+  M5.Display.println("BtnB select  BtnA OK");
   for (int i = 0; i < (int)options.size() && i < 4; ++i) {
     String opt = options[i].as<String>();
+    if (opt.length() > 10) opt = opt.substring(0, 10);
     uint16_t bg = (i == selected) ? BLUE : BLACK;
     uint16_t fg = (i == selected) ? WHITE : YELLOW;
-    int y = 184 + i * 13;
-    M5.Display.fillRect(4, y - 1, 126, 12, bg);
+    int y = 172 + i * 17;
+    M5.Display.fillRect(2, y - 2, 131, 17, bg);
+    M5.Display.setTextSize(2);
     M5.Display.setTextColor(fg, bg);
     M5.Display.setCursor(8, y);
-    M5.Display.print(i == selected ? "> " : "  ");
     M5.Display.print(opt);
   }
+  M5.Display.setTextSize(1);
 }
 
 static String chooseOption(JsonArray options) {
@@ -344,7 +348,7 @@ static bool pollJobResult(const String &jobId) {
     }
 
     M5.Display.clear(BLACK);
-    drawFaceImage("waiting");
+    drawFaceImage(((millis() - start) / 3000) % 2 == 0 ? "waiting-left" : "waiting-right");
     M5.Display.setTextSize(2);
     M5.Display.setTextColor(YELLOW, BLACK);
     drawWrapped(String("Waiting ") + spin[i++ % 4], 4, 142, 10, 18);
