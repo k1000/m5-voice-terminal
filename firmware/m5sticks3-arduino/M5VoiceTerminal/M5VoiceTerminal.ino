@@ -3,28 +3,31 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include "config.h"
+#include "wolf_faces.h"
 
 // Arduino/M5Unified microphone uploader sketch for StickS3.
 // Requires board: M5StickS3, libraries: M5Unified, M5GFX.
 // Iteration target: press BtnA, record short WAV, POST to /voice-command.
 
 static constexpr uint32_t SAMPLE_RATE = 16000;
-static constexpr uint32_t RECORD_SECONDS = 3;
-static constexpr size_t SAMPLE_COUNT = SAMPLE_RATE * RECORD_SECONDS;
+static constexpr uint32_t MAX_RECORD_SECONDS = 10;
+static constexpr uint32_t MIN_RECORD_MS = 300;
+static constexpr size_t MAX_SAMPLE_COUNT = SAMPLE_RATE * MAX_RECORD_SECONDS;
 static int16_t *samples = nullptr;
+static size_t recorded_samples = 0;
 static const String SERVER_BASE_URL = String(VOICE_URL).substring(0, String(VOICE_URL).lastIndexOf('/'));
 static constexpr uint32_t POLL_INTERVAL_MS = 1500;
 static constexpr uint32_t POLL_TIMEOUT_MS = 120000;
 static constexpr uint8_t SPEAKER_VOLUME = 230;  // Keep <= ~230 on battery to avoid brownouts.
 
-static void drawWrapped(const String &text, int x, int y, int maxChars = 22) {
+static void drawWrapped(const String &text, int x, int y, int maxChars = 22, int lineHeight = 12) {
   int lineLen = 0;
   M5.Display.setCursor(x, y);
   for (size_t i = 0; i < text.length(); ++i) {
     char c = text[i];
     if (c == '\n' || lineLen >= maxChars) {
-      y += 12;
-      if (y > M5.Display.height() - 10) return;
+      y += lineHeight;
+      if (y > M5.Display.height() - lineHeight) return;
       M5.Display.setCursor(x, y);
       lineLen = 0;
       if (c == '\n') continue;
@@ -50,43 +53,38 @@ static uint16_t sentimentColor(const String &sentiment) {
   return YELLOW;
 }
 
+static const uint16_t *faceDataFor(const String &state) {
+  if (state == "recording") return WOLF_FACE_RECORDING;
+  if (state == "waiting") return WOLF_FACE_WAITING;
+  if (state == "happy") return WOLF_FACE_HAPPY;
+  if (state == "sad") return WOLF_FACE_SAD;
+  return WOLF_FACE_NEUTRAL;
+}
+
+static void drawFaceImage(const String &state) {
+  // RGB565 arrays are stored as normal 16-bit values in ESP32 little-endian memory.
+  // ST7789 expects big-endian pixel bytes, so enable byte swap for correct colors.
+  bool oldSwap = M5.Display.getSwapBytes();
+  M5.Display.setSwapBytes(true);
+  M5.Display.pushImage(0, 0, WOLF_FACE_WIDTH, WOLF_FACE_HEIGHT, faceDataFor(state));
+  M5.Display.setSwapBytes(oldSwap);
+}
+
 static void drawFace(const String &sentiment) {
-  const int cx = M5.Display.width() / 2;
-  const int cy = 50;
-  const int r = 28;
-  const uint16_t color = sentimentColor(sentiment);
-
-  M5.Display.drawCircle(cx, cy, r, color);
-  M5.Display.fillCircle(cx - 10, cy - 8, 3, color);
-  M5.Display.fillCircle(cx + 10, cy - 8, 3, color);
-
-  if (sentiment == "happy") {
-    M5.Display.drawLine(cx - 14, cy + 8, cx - 7, cy + 15, color);
-    M5.Display.drawLine(cx - 7, cy + 15, cx + 7, cy + 15, color);
-    M5.Display.drawLine(cx + 7, cy + 15, cx + 14, cy + 8, color);
-  } else if (sentiment == "sad") {
-    M5.Display.drawLine(cx - 14, cy + 17, cx - 7, cy + 10, color);
-    M5.Display.drawLine(cx - 7, cy + 10, cx + 7, cy + 10, color);
-    M5.Display.drawLine(cx + 7, cy + 10, cx + 14, cy + 17, color);
-  } else {
-    M5.Display.drawLine(cx - 14, cy + 12, cx + 14, cy + 12, color);
-  }
+  drawFaceImage(sentiment);
 }
 
 static void drawSentimentResponse(const String &sentimentInput, const String &line = "") {
   String sentiment = sentimentInput;
   if (sentiment != "happy" && sentiment != "neutral" && sentiment != "sad") sentiment = "neutral";
   M5.Display.clear(BLACK);
-  M5.Display.setTextSize(1);
-  M5.Display.setTextColor(sentimentColor(sentiment), BLACK);
-  M5.Display.setCursor(4, 6);
-  M5.Display.println("Face: " + sentiment);
   drawFace(sentiment);
+  M5.Display.setTextSize(2);
   M5.Display.setTextColor(WHITE, BLACK);
-  drawWrapped(line, 4, 88, 12);
+  drawWrapped(line, 4, 142, 10, 18);
 }
 
-static bool downloadAndDrawImage(const String &imageUrl, int width = 96, int height = 96) {
+static bool downloadAndDrawImage(const String &imageUrl, int width = 135, int height = 135) {
   if (!imageUrl.length()) return false;
   String url = imageUrl.startsWith("http") ? imageUrl : SERVER_BASE_URL + imageUrl;
   HTTPClient http;
@@ -120,7 +118,10 @@ static bool downloadAndDrawImage(const String &imageUrl, int width = 96, int hei
   }
   http.end();
   if (readTotal == len) {
-    M5.Display.pushImage((M5.Display.width() - width) / 2, 46, width, height, (uint16_t *)rgb);
+    bool oldSwap = M5.Display.getSwapBytes();
+    M5.Display.setSwapBytes(true);
+    M5.Display.pushImage((M5.Display.width() - width) / 2, 0, width, height, (uint16_t *)rgb);
+    M5.Display.setSwapBytes(oldSwap);
     free(rgb);
     return true;
   }
@@ -168,8 +169,12 @@ static bool connectWiFi() {
   return false;
 }
 
-static bool recordAudio() {
-  drawStatus("Recording", "speak now");
+static bool recordAudioWhileHeld() {
+  M5.Display.clear(BLACK);
+  drawFaceImage("recording");
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(WHITE, BLACK);
+  drawWrapped("Hold to talk\nRelease send", 4, 142, 10, 18);
   M5.Speaker.end(); // StickS3 cannot reliably use mic and speaker together.
   if (!M5.Mic.isEnabled()) {
     if (!M5.Mic.begin()) {
@@ -178,19 +183,31 @@ static bool recordAudio() {
     }
   }
 
-  size_t offset = 0;
+  recorded_samples = 0;
   static constexpr size_t CHUNK = 256;
-  while (offset < SAMPLE_COUNT) {
-    size_t n = min(CHUNK, SAMPLE_COUNT - offset);
-    if (M5.Mic.record(samples + offset, n, SAMPLE_RATE)) {
-      offset += n;
-      M5.Display.fillRect(4, 52, (offset * 120) / SAMPLE_COUNT, 8, GREEN);
+  uint32_t started = millis();
+  while (recorded_samples < MAX_SAMPLE_COUNT) {
+    M5.update();
+    if (!M5.BtnA.isPressed() && millis() - started >= MIN_RECORD_MS) {
+      break;
+    }
+    size_t n = min(CHUNK, MAX_SAMPLE_COUNT - recorded_samples);
+    if (M5.Mic.record(samples + recorded_samples, n, SAMPLE_RATE)) {
+      recorded_samples += n;
+      M5.Display.fillRect(4, 62, (recorded_samples * 120) / MAX_SAMPLE_COUNT, 8, GREEN);
     } else {
       delay(1);
     }
-    M5.update();
   }
   M5.Mic.end();
+
+  uint32_t duration = millis() - started;
+  if (duration < MIN_RECORD_MS || recorded_samples < SAMPLE_RATE / 4) {
+    drawStatus("Too short", "hold longer");
+    delay(1000);
+    return false;
+  }
+  drawStatus("Recorded", String(duration / 1000.0, 1) + " sec");
   return true;
 }
 
@@ -200,6 +217,47 @@ static String extractJobId(const String &response) {
   if (err) return "";
   const char *jobId = doc["meta"]["job_id"];
   return jobId ? String(jobId) : "";
+}
+
+static bool pollJobResult(const String &jobId);
+static String postTextCommand(const String &text);
+
+static void drawOptions(JsonArray options, int selected) {
+  M5.Display.fillRect(0, 170, M5.Display.width(), 70, BLACK);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(WHITE, BLACK);
+  M5.Display.setCursor(4, 170);
+  M5.Display.println("BtnB select BtnA OK");
+  for (int i = 0; i < (int)options.size() && i < 4; ++i) {
+    String opt = options[i].as<String>();
+    uint16_t bg = (i == selected) ? BLUE : BLACK;
+    uint16_t fg = (i == selected) ? WHITE : YELLOW;
+    int y = 184 + i * 13;
+    M5.Display.fillRect(4, y - 1, 126, 12, bg);
+    M5.Display.setTextColor(fg, bg);
+    M5.Display.setCursor(8, y);
+    M5.Display.print(i == selected ? "> " : "  ");
+    M5.Display.print(opt);
+  }
+}
+
+static String chooseOption(JsonArray options) {
+  if (options.size() == 0) return "";
+  int selected = 0;
+  drawOptions(options, selected);
+  uint32_t started = millis();
+  while (millis() - started < 60000) {
+    M5.update();
+    if (M5.BtnB.wasPressed()) {
+      selected = (selected + 1) % min((int)options.size(), 4);
+      drawOptions(options, selected);
+    }
+    if (M5.BtnA.wasPressed()) {
+      return options[selected].as<String>();
+    }
+    delay(20);
+  }
+  return "";
 }
 
 static bool playAudioUrl(const String &audioUrl) {
@@ -301,15 +359,26 @@ static bool pollJobResult(const String &jobId) {
       String audioUrl = doc["audio_url"] | "";
       String imageUrl = doc["image_url"] | "";
       drawSentimentResponse(sentiment, result);
-      if (imageUrl.length()) {
-        downloadAndDrawImage(imageUrl);
-      }
+      // Standard sentiment faces are bundled in firmware; no download needed.
+      // image_url remains available for future custom images.
       if (audioUrl.length()) {
         delay(700);
         playAudioUrl(audioUrl);
         drawSentimentResponse(sentiment, result);
-        if (imageUrl.length()) {
-          downloadAndDrawImage(imageUrl);
+        // Re-draw local bundled face after audio playback.
+      }
+      JsonArray options = doc["options"].as<JsonArray>();
+      String selected = chooseOption(options);
+      if (selected.length()) {
+        if (selected == "New request") {
+          drawStatus("Ready", "Hold BtnA to talk");
+          return true;
+        }
+        drawStatus("Selected", selected);
+        String response = postTextCommand(selected);
+        String nextJob = extractJobId(response);
+        if (nextJob.length()) {
+          pollJobResult(nextJob);
         }
       }
       return true;
@@ -320,12 +389,41 @@ static bool pollJobResult(const String &jobId) {
       return false;
     }
 
-    drawStatus((String("Waiting ") + spin[i++ % 4]).c_str(), "Job " + jobId + "\n" + status);
+    M5.Display.clear(BLACK);
+    drawFaceImage("waiting");
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(YELLOW, BLACK);
+    drawWrapped(String("Waiting ") + spin[i++ % 4], 4, 142, 10, 18);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(WHITE, BLACK);
+    drawWrapped("Job " + jobId + "\n" + status, 4, 200, 18, 12);
     delay(POLL_INTERVAL_MS);
   }
 
   drawStatus("Timeout", "Job " + jobId);
   return false;
+}
+
+static String postTextCommand(const String &text) {
+  drawStatus("Sending", text);
+  HTTPClient http;
+  http.begin(SERVER_BASE_URL + "/command");
+  http.addHeader("Content-Type", "application/json");
+
+  JsonDocument doc;
+  doc["device"] = DEVICE_ID;
+  doc["event"] = "option_select";
+  doc["text"] = text;
+  String payload;
+  serializeJson(doc, payload);
+
+  int code = http.POST(payload);
+  String response = http.getString();
+  http.end();
+  if (code != 200) {
+    drawStatus("Send HTTP", String(code));
+  }
+  return response;
 }
 
 static String postAudio() {
@@ -346,8 +444,8 @@ static String postAudio() {
   String tail = "\r\n--" + boundary + "--\r\n";
 
   uint8_t wavHeader[44];
-  writeWavHeader(wavHeader, SAMPLE_RATE, SAMPLE_COUNT);
-  const size_t audioBytes = SAMPLE_COUNT * sizeof(int16_t);
+  writeWavHeader(wavHeader, SAMPLE_RATE, recorded_samples);
+  const size_t audioBytes = recorded_samples * sizeof(int16_t);
   const size_t total = head.length() + sizeof(wavHeader) + audioBytes + tail.length();
 
   uint8_t *body = (uint8_t *)ps_malloc(total);
@@ -375,13 +473,13 @@ void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
   M5.Display.setRotation(0);
-  samples = (int16_t *)ps_malloc(SAMPLE_COUNT * sizeof(int16_t));
+  samples = (int16_t *)ps_malloc(MAX_SAMPLE_COUNT * sizeof(int16_t));
   if (!samples) {
     drawStatus("OOM", "samples");
     while (true) delay(1000);
   }
   connectWiFi();
-  drawStatus("Ready", "BtnA: record");
+  drawStatus("Ready", "Hold BtnA to talk");
 }
 
 void loop() {
@@ -391,7 +489,9 @@ void loop() {
       delay(1000);
       return;
     }
-    if (recordAudio()) {
+    // Debounce and let the user hold BtnA to talk.
+    delay(80);
+    if (recordAudioWhileHeld()) {
       String response = postAudio();
       String jobId = extractJobId(response);
       if (jobId.length()) {

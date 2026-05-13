@@ -15,7 +15,7 @@ import sys
 import urllib.error
 import urllib.request
 
-DEFAULT_BASE_URL = "http://127.0.0.1:8000"
+DEFAULT_BASE_URL = "http://127.0.0.1:8010"
 
 
 def request(method: str, url: str, payload: dict | None = None) -> dict | None:

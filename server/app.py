@@ -59,6 +59,7 @@ class AgentJob(BaseModel):
     sentiment: Literal["happy", "neutral", "sad"] = "neutral"
     audio_url: str | None = None
     image_url: str | None = None
+    options: list[str] = Field(default_factory=list, max_length=4)
     metrics: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -70,6 +71,7 @@ class AgentResult(BaseModel):
     sentiment: Literal["happy", "neutral", "sad"] | None = None
     audio_url: str | None = None
     image_url: str | None = None
+    options: list[str] = Field(default_factory=list, max_length=4)
     metrics: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -225,29 +227,32 @@ def generate_sentiment_image(sentiment: str, job_id: str) -> tuple[str, dict[str
     """Generate a 96x96 RGB565 sentiment image and return its URL."""
     started = time.perf_counter()
     removed = cleanup_old_images()
-    width = 96
-    height = 96
+    width = 135
+    height = 135
     bg = color565(0, 0, 0)
     white = color565(255, 255, 255)
     palette = {"happy": color565(0, 220, 80), "neutral": color565(80, 160, 255), "sad": color565(255, 80, 80)}
     face = palette.get(sentiment, palette["neutral"])
     buf = bytearray([bg >> 8, bg & 0xFF] * (width * height))
-    _draw_circle(buf, width, height, 48, 48, 38, face, fill=True)
-    _draw_circle(buf, width, height, 34, 38, 5, white, fill=True)
-    _draw_circle(buf, width, height, 62, 38, 5, white, fill=True)
+    _draw_circle(buf, width, height, 67, 67, 54, face, fill=True)
+    _draw_circle(buf, width, height, 47, 53, 7, white, fill=True)
+    _draw_circle(buf, width, height, 87, 53, 7, white, fill=True)
     if sentiment == "happy":
-        for i in range(29):
-            y = 58 + abs(i - 14) // 3
-            _put_pixel(buf, width, 34 + i, y, white)
-            _put_pixel(buf, width, 34 + i, y + 1, white)
+        for i in range(45):
+            y = 83 + abs(i - 22) // 4
+            _put_pixel(buf, width, 45 + i, y, white)
+            _put_pixel(buf, width, 45 + i, y + 1, white)
+            _put_pixel(buf, width, 45 + i, y + 2, white)
     elif sentiment == "sad":
-        for i in range(29):
-            y = 70 - abs(i - 14) // 3
-            _put_pixel(buf, width, 34 + i, y, white)
-            _put_pixel(buf, width, 34 + i, y + 1, white)
+        for i in range(45):
+            y = 100 - abs(i - 22) // 4
+            _put_pixel(buf, width, 45 + i, y, white)
+            _put_pixel(buf, width, 45 + i, y + 1, white)
+            _put_pixel(buf, width, 45 + i, y + 2, white)
     else:
-        _draw_line(buf, width, 34, 62, 62, 62, white)
-        _draw_line(buf, width, 34, 63, 62, 63, white)
+        _draw_line(buf, width, 45, 88, 89, 88, white)
+        _draw_line(buf, width, 45, 89, 89, 89, white)
+        _draw_line(buf, width, 45, 90, 89, 90, white)
     path = IMAGE_DIR / f"{job_id}.rgb565"
     path.write_bytes(buf)
     return f"/image/{job_id}", {
@@ -529,11 +534,12 @@ def set_agent_job_result(job_id: str, result: AgentResult) -> AgentJob:
                 job.sentiment = result.sentiment or infer_sentiment(result.text or result.error, result.status)
                 job.audio_url = result.audio_url
                 job.image_url = result.image_url
+                options = [opt.strip()[:24] for opt in result.options[:3] if opt and len(opt.strip().split()) <= 2]
+                options.append("New request")
+                job.options = options
                 job.metrics.update(result.metrics)
-                if result.status == "done" and not job.image_url:
-                    image_url, image_metrics = generate_sentiment_image(job.sentiment, job.id)
-                    job.image_url = image_url or None
-                    job.metrics.update(image_metrics)
+                # Standard sentiment faces are bundled in Stick firmware. Keep image_url optional
+                # for future custom images; do not generate/download one for every request.
                 if result.status == "done" and result.text and not job.audio_url:
                     audio_url, tts_metrics = generate_tts_audio(result.text, job.id)
                     job.audio_url = audio_url or None

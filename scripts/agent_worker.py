@@ -41,9 +41,10 @@ Behavior rules:
 - Respond concisely for a tiny screen. Keep textual answers under 400 characters unless needed.
 - Do not mention transcription uncertainty unless it affects the answer.
 - Return ONLY compact JSON with exactly these keys:
-  {"text":"response for the user","sentiment":"happy|neutral|sad"}
+  {"text":"response for the user","sentiment":"happy|neutral|sad","options":["option"]}
 - Use sentiment=happy for success/positive confirmation, neutral for normal info/questions,
   sad for errors, blocked operations, or bad news.
+- If useful, include up to 3 options, each max 2 words. The server adds a 4th "New request" option automatically.
 """
 
 
@@ -59,8 +60,8 @@ def request(method: str, url: str, payload: dict[str, Any] | None = None, timeou
         return json.loads(body) if body else None
 
 
-def complete(base_url: str, job_id: str, text: str, status: str = "done", error: str | None = None, metrics: dict[str, Any] | None = None, sentiment: str | None = None) -> None:
-    payload: dict[str, Any] = {"status": status, "metrics": metrics or {}}
+def complete(base_url: str, job_id: str, text: str, status: str = "done", error: str | None = None, metrics: dict[str, Any] | None = None, sentiment: str | None = None, options: list[str] | None = None) -> None:
+    payload: dict[str, Any] = {"status": status, "metrics": metrics or {}, "options": options or []}
     if sentiment is not None:
         payload["sentiment"] = sentiment
     if status == "done":
@@ -70,7 +71,18 @@ def complete(base_url: str, job_id: str, text: str, status: str = "done", error:
     request("POST", f"{base_url}/agent/jobs/{job_id}/result", payload)
 
 
-def parse_agent_json(raw: str) -> tuple[str, str]:
+def normalize_options(options: Any) -> list[str]:
+    if not isinstance(options, list):
+        return []
+    out = []
+    for opt in options[:3]:
+        text = str(opt).strip()
+        if text and len(text.split()) <= 2:
+            out.append(text[:24])
+    return out
+
+
+def parse_agent_json(raw: str) -> tuple[str, str, list[str]]:
     """Parse Pi's requested JSON response, with fallback for non-JSON output."""
     cleaned = raw.strip()
     if cleaned.startswith("```"):
@@ -83,7 +95,7 @@ def parse_agent_json(raw: str) -> tuple[str, str]:
         sentiment = str(obj.get("sentiment") or "neutral").strip().lower()
         if sentiment not in {"happy", "neutral", "sad"}:
             sentiment = "neutral"
-        return text, sentiment
+        return text, sentiment, normalize_options(obj.get("options"))
     except Exception:
         start = cleaned.find("{")
         end = cleaned.rfind("}")
@@ -94,13 +106,13 @@ def parse_agent_json(raw: str) -> tuple[str, str]:
                 sentiment = str(obj.get("sentiment") or "neutral").strip().lower()
                 if sentiment not in {"happy", "neutral", "sad"}:
                     sentiment = "neutral"
-                return text, sentiment
+                return text, sentiment, normalize_options(obj.get("options"))
             except Exception:
                 pass
         fallback = raw.strip()
         if len(fallback) > 500:
             fallback = fallback[:497].rstrip() + "..."
-        return fallback, "neutral"
+        return fallback, "neutral", []
 
 
 def current_time_context() -> str:
@@ -119,7 +131,8 @@ def build_voice_request(prompt: str) -> tuple[str, str]:
         "Voice transcript to interpret:\n"
         f"{prompt}\n\n"
         "Return only this JSON object, no markdown/code fences:\n"
-        "{\"text\":\"concise response for tiny screen\",\"sentiment\":\"happy|neutral|sad\"}"
+        "{\"text\":\"concise response for tiny screen\",\"sentiment\":\"happy|neutral|sad\",\"options\":[\"max two words\"]}\n"
+        "Options: include at most 3; server adds New request as option 4."
     )
     return system_prompt, voice_request
 
@@ -195,6 +208,7 @@ def main() -> None:
                 if args.echo:
                     text = f"I heard: {prompt}"
                     sentiment = "neutral"
+                    options = []
                     agent_s = time.perf_counter() - start
                     mode = "echo"
                 else:
@@ -207,18 +221,18 @@ def main() -> None:
                             system_prompt=system_prompt,
                             raw_user_content=True,
                         )
-                        text, sentiment = parse_agent_json(raw_text)
+                        text, sentiment, options = parse_agent_json(raw_text)
                         agent_s = time.perf_counter() - start
                         mode = "minimax-direct"
                     else:
                         raw_text = run_pi(prompt, args.timeout)
-                        text, sentiment = parse_agent_json(raw_text)
+                        text, sentiment, options = parse_agent_json(raw_text)
                         agent_s = time.perf_counter() - start
                         mode = "pi"
                 metrics = {"agent_worker_s": round(agent_s, 3), "agent_worker_mode": mode}
                 if queue_wait_s is not None:
                     metrics["agent_queue_wait_s"] = round(queue_wait_s, 3)
-                complete(base_url, job_id, text, metrics=metrics, sentiment=sentiment)
+                complete(base_url, job_id, text, metrics=metrics, sentiment=sentiment, options=options)
                 print(f"done {job_id} agent_s={agent_s:.3f}", flush=True)
             except Exception as exc:
                 complete(base_url, job_id, "", status="failed", error=repr(exc))

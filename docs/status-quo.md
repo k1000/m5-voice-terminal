@@ -6,8 +6,8 @@ Date: 2026-05-13
 
 ```
 [M5StickS3]
-  BtnA pressed
-  → record 3s 16 kHz mono PCM
+  BtnA held
+  → record 16 kHz mono PCM until release (up to 10s; minimum ~300ms)
   → wrap as WAV
   → POST /voice-command
         │
@@ -25,7 +25,7 @@ Date: 2026-05-13
         ▼
 [M5StickS3]
   polls GET /agent/jobs/{id} every 1.5s
-  → status=done → display result_text on LCD
+  → status=done → display result_text/image on LCD and play audio_url WAV when present
 ```
 
 ## Current Runtime State
@@ -47,7 +47,7 @@ GET  /agent/jobs/next?worker=pi   → claim oldest queued job
 GET  /agent/jobs/{id}             → job detail including result_text, sentiment, audio_url
 POST /agent/jobs/{id}/result      → post result from agent; server generates Supertonic WAV
 GET  /audio/{job_id}              → download generated WAV response audio; audio id equals job id
-POST /tts                         → Supertonic TTS WAV generation (future/manual)
+GET  /image/{job_id}              → download generated RGB565 sentiment image; image id equals job id
 ```
 
 Completed job response shape now includes:
@@ -57,6 +57,7 @@ Completed job response shape now includes:
   "status": "done",
   "result_text": "Audio response JSON ready",
   "sentiment": "happy",
+  "image_url": "/image/<job_id>",
   "audio_url": "/audio/<job_id>"
 }
 ```
@@ -126,19 +127,18 @@ Current bottleneck: agent response generation (~6–25s). STT is fast (<2s warm)
 
 ## Known Issues
 
-- Stick screen result is cleared on next BtnA press (fixed after last fix).
-- Server default port changed to **8010** (8000 already in use by another service).
+- Server default port changed to **8010** (8000 already in use by another service); older helper defaults may still need explicit `--base-url` if not updated.
 - First mlx-whisper run is slow due to model download; subsequent runs are fast.
 - Audio playback speed issue was traced to writing Supertonic output as 24 kHz. Server now writes PCM_16 WAV at Supertonic's native sample rate, currently 44.1 kHz.
-- The server deletes old generated WAV files whenever a new response audio file is generated; the Stick downloads audio into PSRAM and frees it after playback.
+- The server deletes old generated WAV/image files whenever a new response artifact is generated; the Stick downloads artifacts into PSRAM and frees them after playback/display.
 
 ## Next Steps
 
-1. **TTS / audio output** — connect Supertonic to return WAV audio URL in job result, download and play through Stick speaker.
-2. **VAD / silence filter** — reject audio that is too quiet or contains no speech to reduce hallucination.
-3. **Real mic benchmark** — capture and test actual StickS3 microphone recordings vs synthetic samples.
+1. **VAD / silence filter** — reject audio that is too quiet or contains no speech to reduce hallucination.
+2. **Real mic benchmark** — capture and test actual StickS3 microphone recordings vs synthetic samples.
+3. **Hold-to-talk UX** — tune maximum duration, minimum duration, and progress indication after real-device testing.
 4. **Reduce agent latency** — compare MiniMax-M2.7-highspeed vs other model aliases; test with tools disabled for comparison.
-5. **Confirm Supertonic** — `/tts` endpoint exists but not yet wired to Stick client.
+5. **Runtime runbook** — replace volatile PID/status rows with a repeatable process supervisor or check script.
 
 ## Project Structure
 
