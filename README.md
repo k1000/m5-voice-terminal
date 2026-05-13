@@ -1,6 +1,6 @@
 # M5StickS3 Voice Terminal MVP
 
-A voice-command terminal for M5StickS3. The active firmware records a hold-to-talk microphone clip, uploads it to a local FastAPI server, the server transcribes it, queues it for a Pi/agent worker, generates a response face/image and Supertonic WAV audio, and the Stick displays/plays the result.
+A voice-command terminal for M5StickS3. The active firmware records a hold-to-talk microphone clip, uploads it to a local FastAPI server, the server transcribes it, queues it for a Pi/agent worker, generates Supertonic WAV audio, and the Stick displays a bundled sentiment face while playing the result.
 
 ## Current flow
 
@@ -13,8 +13,8 @@ M5StickS3 BtnA
   -> queued agent job
   -> scripts/agent_worker.py handles prompt
   -> POST /agent/jobs/{id}/result
-  -> server generates RGB565 sentiment image + Supertonic WAV
-  -> Stick polls job, displays result, downloads image/audio, plays WAV
+  -> server generates Supertonic WAV
+  -> Stick polls job, displays bundled sentiment face/result, downloads audio, plays WAV
 ```
 
 The legacy MicroPython client in `stick/` is retained as a fallback text-command reference. The active device firmware is the Arduino/M5Unified sketch in `firmware/m5sticks3-arduino/M5VoiceTerminal/`.
@@ -92,12 +92,12 @@ Completed job response shape includes:
   "status": "done",
   "result_text": "Answer text",
   "sentiment": "happy",
-  "image_url": "/image/<job_id>",
+  "image_url": null,
   "audio_url": "/audio/<job_id>"
 }
 ```
 
-If sentiment is omitted, the server infers a simple `happy`, `neutral`, or `sad` fallback from the result text/status.
+If sentiment is omitted, the server infers a simple `happy`, `neutral`, or `sad` fallback from the result text/status. `image_url` remains available for future custom RGB565 images; standard faces are bundled in firmware.
 
 ## Stick firmware
 

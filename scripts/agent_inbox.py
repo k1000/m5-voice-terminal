@@ -13,22 +13,15 @@ import argparse
 import json
 import sys
 import urllib.error
-import urllib.request
+
+from http_json import request_json
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8010"
 
 
 def request(method: str, url: str, payload: dict | None = None) -> dict | None:
-    data = None
-    headers = {}
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=30) as response:
-            body = response.read().decode("utf-8")
-            return json.loads(body) if body else None
+        return request_json(method, url, payload)
     except urllib.error.HTTPError as exc:
         print(exc.read().decode("utf-8"), file=sys.stderr)
         raise SystemExit(exc.code) from exc

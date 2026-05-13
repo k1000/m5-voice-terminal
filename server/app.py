@@ -152,118 +152,6 @@ def get_whisper_model() -> Any:
     return _whisper_model
 
 
-def color565(r: int, g: int, b: int) -> int:
-    return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-
-
-def _put_pixel(buf: bytearray, width: int, x: int, y: int, color: int) -> None:
-    if x < 0 or y < 0 or x >= width:
-        return
-    i = (y * width + x) * 2
-    if 0 <= i < len(buf) - 1:
-        buf[i] = color >> 8
-        buf[i + 1] = color & 0xFF
-
-
-def _draw_line(buf: bytearray, width: int, x0: int, y0: int, x1: int, y1: int, color: int) -> None:
-    dx = abs(x1 - x0)
-    sx = 1 if x0 < x1 else -1
-    dy = -abs(y1 - y0)
-    sy = 1 if y0 < y1 else -1
-    err = dx + dy
-    while True:
-        _put_pixel(buf, width, x0, y0, color)
-        if x0 == x1 and y0 == y1:
-            break
-        e2 = 2 * err
-        if e2 >= dy:
-            err += dy
-            x0 += sx
-        if e2 <= dx:
-            err += dx
-            y0 += sy
-
-
-def _draw_circle(buf: bytearray, width: int, height: int, cx: int, cy: int, radius: int, color: int, fill: bool = False) -> None:
-    x = radius
-    y = 0
-    err = 0
-    while x >= y:
-        if fill:
-            for yy in range(cy - y, cy + y + 1):
-                _put_pixel(buf, width, cx + x, yy, color)
-                _put_pixel(buf, width, cx - x, yy, color)
-            for yy in range(cy - x, cy + x + 1):
-                _put_pixel(buf, width, cx + y, yy, color)
-                _put_pixel(buf, width, cx - y, yy, color)
-        else:
-            for px, py in ((cx+x, cy+y), (cx+y, cy+x), (cx-y, cy+x), (cx-x, cy+y), (cx-x, cy-y), (cx-y, cy-x), (cx+y, cy-x), (cx+x, cy-y)):
-                if 0 <= py < height:
-                    _put_pixel(buf, width, px, py, color)
-        y += 1
-        if err <= 0:
-            err += 2 * y + 1
-        if err > 0:
-            x -= 1
-            err -= 2 * x + 1
-
-
-def cleanup_old_images(keep_job_id: str | None = None) -> int:
-    _ensure_data_dir()
-    removed = 0
-    keep_name = f"{keep_job_id}.rgb565" if keep_job_id else None
-    for path in IMAGE_DIR.glob("*.rgb565"):
-        if keep_name and path.name == keep_name:
-            continue
-        try:
-            path.unlink()
-            removed += 1
-        except OSError:
-            pass
-    return removed
-
-
-def generate_sentiment_image(sentiment: str, job_id: str) -> tuple[str, dict[str, Any]]:
-    """Generate a 96x96 RGB565 sentiment image and return its URL."""
-    started = time.perf_counter()
-    removed = cleanup_old_images()
-    width = 135
-    height = 135
-    bg = color565(0, 0, 0)
-    white = color565(255, 255, 255)
-    palette = {"happy": color565(0, 220, 80), "neutral": color565(80, 160, 255), "sad": color565(255, 80, 80)}
-    face = palette.get(sentiment, palette["neutral"])
-    buf = bytearray([bg >> 8, bg & 0xFF] * (width * height))
-    _draw_circle(buf, width, height, 67, 67, 54, face, fill=True)
-    _draw_circle(buf, width, height, 47, 53, 7, white, fill=True)
-    _draw_circle(buf, width, height, 87, 53, 7, white, fill=True)
-    if sentiment == "happy":
-        for i in range(45):
-            y = 83 + abs(i - 22) // 4
-            _put_pixel(buf, width, 45 + i, y, white)
-            _put_pixel(buf, width, 45 + i, y + 1, white)
-            _put_pixel(buf, width, 45 + i, y + 2, white)
-    elif sentiment == "sad":
-        for i in range(45):
-            y = 100 - abs(i - 22) // 4
-            _put_pixel(buf, width, 45 + i, y, white)
-            _put_pixel(buf, width, 45 + i, y + 1, white)
-            _put_pixel(buf, width, 45 + i, y + 2, white)
-    else:
-        _draw_line(buf, width, 45, 88, 89, 88, white)
-        _draw_line(buf, width, 45, 89, 89, 89, white)
-        _draw_line(buf, width, 45, 90, 89, 90, white)
-    path = IMAGE_DIR / f"{job_id}.rgb565"
-    path.write_bytes(buf)
-    return f"/image/{job_id}", {
-        "server_image_s": round(time.perf_counter() - started, 3),
-        "image_format": "rgb565",
-        "image_width": width,
-        "image_height": height,
-        "image_removed_old_files": removed,
-    }
-
-
 def get_tts_engine() -> Any:
     """Lazy-load Supertonic TTS when an agent result needs audio."""
     global _tts_engine
@@ -361,6 +249,12 @@ def transcribe_audio(path: str) -> tuple[str, dict[str, Any]]:
         }
 
     raise HTTPException(status_code=500, detail=f"unsupported STT_BACKEND={STT_BACKEND!r}")
+
+
+def normalize_options(options: list[str]) -> list[str]:
+    """Keep only concise button labels; the Stick has room for four short choices."""
+    normalized = [opt.strip()[:24] for opt in options[:3] if opt and len(opt.strip().split()) <= 2]
+    return [*normalized, "New request"]
 
 
 def queue_response(device: str, prompt: str, event: str, meta_extra: dict[str, Any] | None = None) -> CommandResponse:
@@ -534,9 +428,7 @@ def set_agent_job_result(job_id: str, result: AgentResult) -> AgentJob:
                 job.sentiment = result.sentiment or infer_sentiment(result.text or result.error, result.status)
                 job.audio_url = result.audio_url
                 job.image_url = result.image_url
-                options = [opt.strip()[:24] for opt in result.options[:3] if opt and len(opt.strip().split()) <= 2]
-                options.append("New request")
-                job.options = options
+                job.options = normalize_options(result.options)
                 job.metrics.update(result.metrics)
                 # Standard sentiment faces are bundled in Stick firmware. Keep image_url optional
                 # for future custom images; do not generate/download one for every request.

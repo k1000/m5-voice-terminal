@@ -47,12 +47,6 @@ static void drawStatus(const char *title, const String &line = "") {
   drawWrapped(line, 4, 28);
 }
 
-static uint16_t sentimentColor(const String &sentiment) {
-  if (sentiment == "happy") return GREEN;
-  if (sentiment == "sad") return RED;
-  return YELLOW;
-}
-
 static const uint16_t *faceDataFor(const String &state) {
   if (state == "recording") return WOLF_FACE_RECORDING;
   if (state == "waiting") return WOLF_FACE_WAITING;
@@ -74,6 +68,14 @@ static void drawFace(const String &sentiment) {
   drawFaceImage(sentiment);
 }
 
+static void drawReady() {
+  M5.Display.clear(BLACK);
+  drawFaceImage("neutral");
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(WHITE, BLACK);
+  drawWrapped("Ready\nHold BtnA", 4, 142, 10, 18);
+}
+
 static void drawSentimentResponse(const String &sentimentInput, const String &line = "") {
   String sentiment = sentimentInput;
   if (sentiment != "happy" && sentiment != "neutral" && sentiment != "sad") sentiment = "neutral";
@@ -82,51 +84,6 @@ static void drawSentimentResponse(const String &sentimentInput, const String &li
   M5.Display.setTextSize(2);
   M5.Display.setTextColor(WHITE, BLACK);
   drawWrapped(line, 4, 142, 10, 18);
-}
-
-static bool downloadAndDrawImage(const String &imageUrl, int width = 135, int height = 135) {
-  if (!imageUrl.length()) return false;
-  String url = imageUrl.startsWith("http") ? imageUrl : SERVER_BASE_URL + imageUrl;
-  HTTPClient http;
-  http.begin(url);
-  int code = http.GET();
-  if (code != 200) {
-    http.end();
-    return false;
-  }
-  int len = http.getSize();
-  int expected = width * height * 2;
-  if (len != expected) {
-    http.end();
-    return false;
-  }
-  uint8_t *rgb = (uint8_t *)ps_malloc(len);
-  if (!rgb) {
-    http.end();
-    return false;
-  }
-  WiFiClient *stream = http.getStreamPtr();
-  int readTotal = 0;
-  uint32_t started = millis();
-  while (http.connected() && readTotal < len && millis() - started < 10000) {
-    size_t available = stream->available();
-    if (available) {
-      readTotal += stream->readBytes(rgb + readTotal, min((int)available, len - readTotal));
-    } else {
-      delay(1);
-    }
-  }
-  http.end();
-  if (readTotal == len) {
-    bool oldSwap = M5.Display.getSwapBytes();
-    M5.Display.setSwapBytes(true);
-    M5.Display.pushImage((M5.Display.width() - width) / 2, 0, width, height, (uint16_t *)rgb);
-    M5.Display.setSwapBytes(oldSwap);
-    free(rgb);
-    return true;
-  }
-  free(rgb);
-  return false;
 }
 
 static void writeWavHeader(uint8_t *header, uint32_t sampleRate, uint32_t sampleCount) {
@@ -357,10 +314,7 @@ static bool pollJobResult(const String &jobId) {
       String result = doc["result_text"] | "[done: no text]";
       String sentiment = doc["sentiment"] | "neutral";
       String audioUrl = doc["audio_url"] | "";
-      String imageUrl = doc["image_url"] | "";
       drawSentimentResponse(sentiment, result);
-      // Standard sentiment faces are bundled in firmware; no download needed.
-      // image_url remains available for future custom images.
       if (audioUrl.length()) {
         delay(700);
         playAudioUrl(audioUrl);
@@ -371,7 +325,7 @@ static bool pollJobResult(const String &jobId) {
       String selected = chooseOption(options);
       if (selected.length()) {
         if (selected == "New request") {
-          drawStatus("Ready", "Hold BtnA to talk");
+          drawReady();
           return true;
         }
         drawStatus("Selected", selected);
@@ -479,7 +433,7 @@ void setup() {
     while (true) delay(1000);
   }
   connectWiFi();
-  drawStatus("Ready", "Hold BtnA to talk");
+  drawReady();
 }
 
 void loop() {

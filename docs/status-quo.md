@@ -25,7 +25,7 @@ Date: 2026-05-13
         ▼
 [M5StickS3]
   polls GET /agent/jobs/{id} every 1.5s
-  → status=done → display result_text/image on LCD and play audio_url WAV when present
+  → status=done → display bundled sentiment face/result_text on LCD and play audio_url WAV when present
 ```
 
 ## Current Runtime State
@@ -47,7 +47,7 @@ GET  /agent/jobs/next?worker=pi   → claim oldest queued job
 GET  /agent/jobs/{id}             → job detail including result_text, sentiment, audio_url
 POST /agent/jobs/{id}/result      → post result from agent; server generates Supertonic WAV
 GET  /audio/{job_id}              → download generated WAV response audio; audio id equals job id
-GET  /image/{job_id}              → download generated RGB565 sentiment image; image id equals job id
+GET  /image/{job_id}              → download optional custom RGB565 image; standard faces are bundled in firmware
 ```
 
 Completed job response shape now includes:
@@ -57,7 +57,7 @@ Completed job response shape now includes:
   "status": "done",
   "result_text": "Audio response JSON ready",
   "sentiment": "happy",
-  "image_url": "/image/<job_id>",
+  "image_url": null,
   "audio_url": "/audio/<job_id>"
 }
 ```
@@ -130,7 +130,7 @@ Current bottleneck: agent response generation (~6–25s). STT is fast (<2s warm)
 - Server default port changed to **8010** (8000 already in use by another service); older helper defaults may still need explicit `--base-url` if not updated.
 - First mlx-whisper run is slow due to model download; subsequent runs are fast.
 - Audio playback speed issue was traced to writing Supertonic output as 24 kHz. Server now writes PCM_16 WAV at Supertonic's native sample rate, currently 44.1 kHz.
-- The server deletes old generated WAV/image files whenever a new response artifact is generated; the Stick downloads artifacts into PSRAM and frees them after playback/display.
+- The server deletes old generated WAV files whenever a new TTS artifact is generated; the Stick downloads audio into PSRAM and frees it after playback.
 
 ## Next Steps
 

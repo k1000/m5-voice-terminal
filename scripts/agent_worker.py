@@ -14,11 +14,11 @@ import subprocess
 import sys
 import time
 import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(__file__))
+from http_json import request_json
 from minimax_direct import call_minimax
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8010"
@@ -48,18 +48,6 @@ Behavior rules:
 """
 
 
-def request(method: str, url: str, payload: dict[str, Any] | None = None, timeout: int = 30) -> Any:
-    data = None
-    headers = {}
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        body = response.read().decode("utf-8")
-        return json.loads(body) if body else None
-
-
 def complete(base_url: str, job_id: str, text: str, status: str = "done", error: str | None = None, metrics: dict[str, Any] | None = None, sentiment: str | None = None, options: list[str] | None = None) -> None:
     payload: dict[str, Any] = {"status": status, "metrics": metrics or {}, "options": options or []}
     if sentiment is not None:
@@ -68,7 +56,7 @@ def complete(base_url: str, job_id: str, text: str, status: str = "done", error:
         payload["text"] = text
     else:
         payload["error"] = error or text
-    request("POST", f"{base_url}/agent/jobs/{job_id}/result", payload)
+    request_json("POST", f"{base_url}/agent/jobs/{job_id}/result", payload)
 
 
 def normalize_options(options: Any) -> list[str]:
@@ -82,6 +70,14 @@ def normalize_options(options: Any) -> list[str]:
     return out
 
 
+def response_tuple(obj: dict[str, Any], raw: str) -> tuple[str, str, list[str]]:
+    text = str(obj.get("text") or obj.get("response") or raw).strip()
+    sentiment = str(obj.get("sentiment") or "neutral").strip().lower()
+    if sentiment not in {"happy", "neutral", "sad"}:
+        sentiment = "neutral"
+    return text, sentiment, normalize_options(obj.get("options"))
+
+
 def parse_agent_json(raw: str) -> tuple[str, str, list[str]]:
     """Parse Pi's requested JSON response, with fallback for non-JSON output."""
     cleaned = raw.strip()
@@ -89,30 +85,25 @@ def parse_agent_json(raw: str) -> tuple[str, str, list[str]]:
         cleaned = cleaned.strip("`").strip()
         if cleaned.lower().startswith("json"):
             cleaned = cleaned[4:].strip()
-    try:
-        obj = json.loads(cleaned)
-        text = str(obj.get("text") or obj.get("response") or raw).strip()
-        sentiment = str(obj.get("sentiment") or "neutral").strip().lower()
-        if sentiment not in {"happy", "neutral", "sad"}:
-            sentiment = "neutral"
-        return text, sentiment, normalize_options(obj.get("options"))
-    except Exception:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start >= 0 and end > start:
-            try:
-                obj = json.loads(cleaned[start:end + 1])
-                text = str(obj.get("text") or obj.get("response") or raw).strip()
-                sentiment = str(obj.get("sentiment") or "neutral").strip().lower()
-                if sentiment not in {"happy", "neutral", "sad"}:
-                    sentiment = "neutral"
-                return text, sentiment, normalize_options(obj.get("options"))
-            except Exception:
-                pass
-        fallback = raw.strip()
-        if len(fallback) > 500:
-            fallback = fallback[:497].rstrip() + "..."
-        return fallback, "neutral", []
+
+    candidates = [cleaned]
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start >= 0 and end > start:
+        candidates.append(cleaned[start:end + 1])
+
+    for candidate in candidates:
+        try:
+            obj = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            return response_tuple(obj, raw)
+
+    fallback = raw.strip()
+    if len(fallback) > 500:
+        fallback = fallback[:497].rstrip() + "..."
+    return fallback, "neutral", []
 
 
 def current_time_context() -> str:
@@ -164,7 +155,7 @@ def run_pi(prompt: str, timeout: int) -> str:
 
 
 def next_queued_job(base_url: str) -> dict[str, Any] | None:
-    data = request("GET", f"{base_url}/agent/jobs?status=queued")
+    data = request_json("GET", f"{base_url}/agent/jobs?status=queued")
     jobs = data.get("jobs", []) if isinstance(data, dict) else []
     if not jobs:
         return None
