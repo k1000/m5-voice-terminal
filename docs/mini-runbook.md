@@ -13,8 +13,10 @@ cd m5-voice-terminal
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+pip install -r requirements-mini.txt
 ```
+
+`requirements-mini.txt` intentionally omits PyTorch/OpenAI Whisper to save disk and uses the MLX Whisper path. Use full `requirements.txt` only if mini has enough free disk and you need the PyTorch Whisper fallback.
 
 Pi worker requirements:
 
