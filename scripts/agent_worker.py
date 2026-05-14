@@ -62,7 +62,8 @@ def complete(base_url: str, job_id: str, text: str, status: str = "done", error:
         payload["text"] = text
     else:
         payload["error"] = error or text
-    request_json("POST", f"{base_url}/agent/jobs/{job_id}/result", payload)
+    # Result POST can block while the server generates Supertonic audio and/or an image.
+    request_json("POST", f"{base_url}/agent/jobs/{job_id}/result", payload, timeout=180)
 
 
 def normalize_options(options: Any) -> list[str]:
