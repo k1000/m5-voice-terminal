@@ -36,6 +36,26 @@ env STT_BACKEND=mlx-whisper MLX_WHISPER_MODEL=mlx-community/whisper-tiny \
   uvicorn server.app:app --host 0.0.0.0 --port 8010
 ```
 
+**Image generation** — the server generates 135x135 RGB565 images when the agent
+returns `image_prompt`.  Two helpers are available:
+
+| Helper | Latency | Quality | Network |
+|---|---|---|---|
+| **MLX SDXL Turbo** (default) | ~7.5s (M3 Max) | Good at 4 steps | Offline |
+| MiniMax API | ~15–20s | Better | Requires API key |
+
+MLX is the default and works offline.  It requires `diffusers` and PyTorch:
+`pip install diffusers transformers`.  Configure with env vars:
+
+```sh
+MLX_IMAGE_HELPER=""        # set to "" to disable MLX
+MLX_IMAGE_MODEL=stabilityai/sdxl-turbo   # default
+MLX_IMAGE_STEPS=4          # 2=faster, 8=better quality
+```
+
+For MiniMax quality, set `MINIMAX_API_KEY` and `MINIMAX_IMAGE_HELPER` (see
+`scripts/minimax_image.py` in the minimax-image skill).
+
 Find the Mac LAN IP:
 
 ```sh
