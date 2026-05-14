@@ -5,3 +5,5 @@ openai-whisper>=20250625
 supertonic>=1.2.1
 soundfile>=0.13.1
 mlx-whisper>=0.4.3
+Pillow>=10.0
+requests>=2.31

@@ -7,6 +7,7 @@ from uuid import uuid4
 import json
 import os
 import time
+import unicodedata
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -71,6 +72,8 @@ class AgentResult(BaseModel):
     sentiment: Literal["happy", "neutral", "sad"] | None = None
     audio_url: str | None = None
     image_url: str | None = None
+    # Optional prompt that asks the server to generate a 135x135 RGB565 response image.
+    image_prompt: str | None = None
     options: list[str] = Field(default_factory=list, max_length=4)
     metrics: dict[str, Any] = Field(default_factory=dict)
 
@@ -178,18 +181,76 @@ def cleanup_old_audio(keep_job_id: str | None = None) -> int:
     return removed
 
 
+def generate_response_image(prompt: str, job_id: str) -> tuple[str | None, dict[str, Any]]:
+    """Generate a 135x135 RGB565 image and return its download URL if successful."""
+    started = time.perf_counter()
+    metrics: dict[str, Any] = {"server_image_prompt": prompt[:180]}
+    helper = Path("/Users/kamil/.pi/agent/skills/minimax-image/scripts/minimax_image.py")
+    jpg_path = IMAGE_DIR / f"{job_id}.jpg"
+    rgb565_path = IMAGE_DIR / f"{job_id}.rgb565"
+    try:
+        if not helper.exists():
+            raise RuntimeError(f"MiniMax image helper not found: {helper}")
+        import subprocess
+        subprocess.run(
+            ["python3", str(helper), prompt, "--square", "135", "--output", str(jpg_path)],
+            text=True,
+            capture_output=True,
+            check=True,
+            timeout=120,
+        )
+        from PIL import Image
+
+        with Image.open(jpg_path) as image:
+            image = image.convert("RGB").resize((135, 135), Image.Resampling.LANCZOS)
+            raw = bytearray()
+            for r, g, b in image.getdata():
+                value = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+                raw.extend(value.to_bytes(2, "little"))
+        rgb565_path.write_bytes(raw)
+        metrics.update({
+            "server_image_s": round(time.perf_counter() - started, 3),
+            "server_image_size": "135x135",
+            "server_image_format": "rgb565-le",
+        })
+        return f"/image/{job_id}", metrics
+    except Exception as exc:
+        metrics.update({
+            "server_image_s": round(time.perf_counter() - started, 3),
+            "server_image_error": repr(exc),
+        })
+        return None, metrics
+
+
+def sanitize_tts_text(text: str) -> str:
+    """Remove invisible/emoji variation chars that Supertonic rejects."""
+    normalized = unicodedata.normalize("NFKC", text)
+    return "".join(
+        ch for ch in normalized
+        if unicodedata.category(ch) not in {"Mn", "Me", "Cf"}
+    ).strip()
+
+
 def generate_tts_audio(text: str, job_id: str) -> tuple[str, dict[str, Any]]:
     """Generate a WAV response with Supertonic and return its download URL."""
     started = time.perf_counter()
     removed = cleanup_old_audio()
-    if not text.strip():
+    tts_text = sanitize_tts_text(text)
+    if not tts_text:
         return "", {"server_tts_s": 0, "server_tts_skipped": True, "tts_removed_old_files": removed}
 
     import soundfile as sf
 
     engine = get_tts_engine()
     style = engine.get_voice_style(voice_name=TTS_VOICE)
-    wav, duration = engine.synthesize(text.strip(), voice_style=style)
+    try:
+        wav, duration = engine.synthesize(tts_text, voice_style=style)
+    except ValueError as exc:
+        ascii_text = tts_text.encode("ascii", "ignore").decode().strip()
+        if not ascii_text or ascii_text == tts_text:
+            return "", {"server_tts_s": round(time.perf_counter() - started, 3), "server_tts_error": repr(exc), "tts_removed_old_files": removed}
+        wav, duration = engine.synthesize(ascii_text, voice_style=style)
+        tts_text = ascii_text
     path = AUDIO_DIR / f"{job_id}.wav"
     sample_rate = int(getattr(engine, "sample_rate", TTS_SAMPLE_RATE) or TTS_SAMPLE_RATE)
     # Write PCM_16 because M5Unified Speaker.playWav supports PCM WAV up to 16-bit.
@@ -204,6 +265,7 @@ def generate_tts_audio(text: str, job_id: str) -> tuple[str, dict[str, Any]]:
         "tts_sample_rate": sample_rate,
         "tts_removed_old_files": removed,
         "tts_duration_s": round(float(duration[0]) if hasattr(duration, "__len__") else float(duration), 3),
+        "tts_text_sanitized": tts_text != text.strip(),
     }
 
 
@@ -269,6 +331,48 @@ def queue_response(device: str, prompt: str, event: str, meta_extra: dict[str, A
             "agent_result_url": f"/agent/jobs/{job.id}/result",
             **(meta_extra or {}),
         },
+    )
+
+
+def completed_response(
+    device: str,
+    event: str,
+    prompt: str,
+    text: str,
+    sentiment: Literal["happy", "neutral", "sad"] = "neutral",
+    meta_extra: dict[str, Any] | None = None,
+    options: list[str] | None = None,
+    generate_audio: bool = False,
+) -> CommandResponse:
+    """Create an already-done job for deterministic server-side replies."""
+    now = utc_now()
+    job = AgentJob(
+        id=uuid4().hex[:12],
+        device=device,
+        event=event,
+        prompt=prompt,
+        status="done",
+        created_at=now,
+        updated_at=now,
+        result_text=text,
+        sentiment=sentiment,
+        options=normalize_options(options or []),
+        metrics=meta_extra or {},
+    )
+    if generate_audio:
+        audio_url, audio_metrics = generate_tts_audio(text, job.id)
+        job.audio_url = audio_url or None
+        job.metrics.update(audio_metrics)
+    job.metrics["server_short_circuit"] = True
+    job.metrics["server_total_until_done_s"] = 0
+    with _jobs_lock:
+        jobs = _load_jobs_unlocked()
+        jobs.append(job)
+        _save_jobs_unlocked(jobs)
+    return CommandResponse(
+        text=text,
+        transcript=prompt,
+        meta={"job_id": job.id, "status": job.status, **(meta_extra or {})},
     )
 
 
@@ -367,14 +471,22 @@ async def voice_command(
         transcript, stt_meta = transcribe_audio(tmp.name)
         stt_s = time.perf_counter() - stt_start
 
-    if not transcript:
-        transcript = "[no speech detected]"
     stt_meta.update({
         "audio_bytes": bytes_written,
         "server_upload_read_s": round(upload_read_s, 3),
         "server_stt_s": round(stt_s, 3),
         "server_voice_command_s": round(time.perf_counter() - total_start, 3),
     })
+    if not transcript:
+        return completed_response(
+            device=device,
+            event=event,
+            prompt="[no speech detected]",
+            text="No howl heard. Try again.",
+            sentiment="neutral",
+            meta_extra={**stt_meta, "server_no_speech_short_circuit": True},
+            options=["Try again"],
+        )
     return queue_response(device, transcript, event, meta_extra=stt_meta)
 
 
@@ -430,8 +542,10 @@ def set_agent_job_result(job_id: str, result: AgentResult) -> AgentJob:
                 job.image_url = result.image_url
                 job.options = normalize_options(result.options)
                 job.metrics.update(result.metrics)
-                # Standard sentiment faces are bundled in Stick firmware. Keep image_url optional
-                # for future custom images; do not generate/download one for every request.
+                if result.status == "done" and result.image_prompt and not job.image_url:
+                    image_url, image_metrics = generate_response_image(result.image_prompt, job.id)
+                    job.image_url = image_url
+                    job.metrics.update(image_metrics)
                 if result.status == "done" and result.text and not job.audio_url:
                     audio_url, tts_metrics = generate_tts_audio(result.text, job.id)
                     job.audio_url = audio_url or None

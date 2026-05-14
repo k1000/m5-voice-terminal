@@ -18,7 +18,26 @@ static size_t recorded_samples = 0;
 static const String SERVER_BASE_URL = String(VOICE_URL).substring(0, String(VOICE_URL).lastIndexOf('/'));
 static constexpr uint32_t POLL_INTERVAL_MS = 1500;
 static constexpr uint32_t POLL_TIMEOUT_MS = 120000;
+static constexpr uint32_t SCREEN_SLEEP_MS = 20000;
+static constexpr uint8_t SCREEN_BRIGHTNESS = 255;
 static constexpr uint8_t SPEAKER_VOLUME = 230;  // Keep <= ~230 on battery to avoid brownouts.
+static uint32_t last_screen_activity_ms = 0;
+static bool screen_awake = true;
+
+static void wakeScreen() {
+  if (!screen_awake) {
+    M5.Display.setBrightness(SCREEN_BRIGHTNESS);
+    screen_awake = true;
+  }
+  last_screen_activity_ms = millis();
+}
+
+static void sleepScreen() {
+  if (screen_awake && millis() - last_screen_activity_ms > SCREEN_SLEEP_MS) {
+    M5.Display.setBrightness(0);
+    screen_awake = false;
+  }
+}
 
 static void drawWrapped(const String &text, int x, int y, int maxChars = 22, int lineHeight = 12) {
   int lineLen = 0;
@@ -38,6 +57,7 @@ static void drawWrapped(const String &text, int x, int y, int maxChars = 22, int
 }
 
 static void drawStatus(const char *title, const String &line = "") {
+  wakeScreen();
   M5.Display.clear(BLACK);
   M5.Display.setTextColor(WHITE, BLACK);
   M5.Display.setTextSize(1);
@@ -71,6 +91,7 @@ static void drawFace(const String &sentiment) {
 }
 
 static void drawReady() {
+  wakeScreen();
   M5.Display.clear(BLACK);
   drawFaceImage("neutral");
   M5.Display.setTextSize(2);
@@ -81,11 +102,68 @@ static void drawReady() {
 static void drawSentimentResponse(const String &sentimentInput, const String &line = "") {
   String sentiment = sentimentInput;
   if (sentiment != "happy" && sentiment != "neutral" && sentiment != "sad") sentiment = "neutral";
+  wakeScreen();
   M5.Display.clear(BLACK);
   drawFace(sentiment);
   M5.Display.setTextSize(2);
   M5.Display.setTextColor(WHITE, BLACK);
   drawWrapped(line, 4, 142, 10, 18);
+}
+
+static bool drawRemoteImageUrl(const String &imageUrl, const String &line = "") {
+  if (!imageUrl.length()) return false;
+  String url = imageUrl.startsWith("http") ? imageUrl : SERVER_BASE_URL + imageUrl;
+  HTTPClient http;
+  http.begin(url);
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    return false;
+  }
+  const int expected = WOLF_FACE_WIDTH * WOLF_FACE_HEIGHT * 2;
+  int len = http.getSize();
+  if (len != expected) {
+    http.end();
+    return false;
+  }
+  uint8_t *bytes = (uint8_t *)ps_malloc(expected);
+  if (!bytes) {
+    http.end();
+    return false;
+  }
+  WiFiClient *stream = http.getStreamPtr();
+  int readTotal = 0;
+  uint32_t started = millis();
+  while (http.connected() && readTotal < expected && millis() - started < 10000) {
+    size_t available = stream->available();
+    if (available) {
+      int n = stream->readBytes(bytes + readTotal, min((int)available, expected - readTotal));
+      readTotal += n;
+    } else {
+      delay(1);
+    }
+  }
+  http.end();
+  if (readTotal != expected) {
+    free(bytes);
+    return false;
+  }
+  wakeScreen();
+  M5.Display.clear(BLACK);
+  bool oldSwap = M5.Display.getSwapBytes();
+  M5.Display.setSwapBytes(true);
+  M5.Display.pushImage(0, 0, WOLF_FACE_WIDTH, WOLF_FACE_HEIGHT, (uint16_t *)bytes);
+  M5.Display.setSwapBytes(oldSwap);
+  free(bytes);
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(WHITE, BLACK);
+  drawWrapped(line, 4, 142, 10, 18);
+  return true;
+}
+
+static void drawJobResponse(const String &sentiment, const String &line, const String &imageUrl) {
+  if (imageUrl.length() && drawRemoteImageUrl(imageUrl, line)) return;
+  drawSentimentResponse(sentiment, line);
 }
 
 static void writeWavHeader(uint8_t *header, uint32_t sampleRate, uint32_t sampleCount) {
@@ -129,6 +207,7 @@ static bool connectWiFi() {
 }
 
 static bool recordAudioWhileHeld() {
+  wakeScreen();
   M5.Display.clear(BLACK);
   drawFaceImage("recording");
   M5.Display.setTextSize(2);
@@ -182,6 +261,7 @@ static bool pollJobResult(const String &jobId);
 static String postTextCommand(const String &text);
 
 static void drawOptions(JsonArray options, int selected) {
+  wakeScreen();
   M5.Display.fillRect(0, 158, M5.Display.width(), 82, BLACK);
   M5.Display.setTextSize(1);
   M5.Display.setTextColor(WHITE, BLACK);
@@ -318,12 +398,13 @@ static bool pollJobResult(const String &jobId) {
       String result = doc["result_text"] | "[done: no text]";
       String sentiment = doc["sentiment"] | "neutral";
       String audioUrl = doc["audio_url"] | "";
-      drawSentimentResponse(sentiment, result);
+      String imageUrl = doc["image_url"] | "";
+      drawJobResponse(sentiment, result, imageUrl);
       if (audioUrl.length()) {
         delay(700);
         playAudioUrl(audioUrl);
-        drawSentimentResponse(sentiment, result);
-        // Re-draw local bundled face after audio playback.
+        drawJobResponse(sentiment, result, imageUrl);
+        // Re-draw response image/face after audio playback.
       }
       JsonArray options = doc["options"].as<JsonArray>();
       String selected = chooseOption(options);
@@ -347,6 +428,7 @@ static bool pollJobResult(const String &jobId) {
       return false;
     }
 
+    wakeScreen();
     M5.Display.clear(BLACK);
     drawFaceImage(((millis() - start) / 3000) % 2 == 0 ? "waiting-left" : "waiting-right");
     M5.Display.setTextSize(2);
@@ -431,6 +513,8 @@ void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
   M5.Display.setRotation(0);
+  M5.Display.setBrightness(SCREEN_BRIGHTNESS);
+  last_screen_activity_ms = millis();
   samples = (int16_t *)ps_malloc(MAX_SAMPLE_COUNT * sizeof(int16_t));
   if (!samples) {
     drawStatus("OOM", "samples");
@@ -442,6 +526,12 @@ void setup() {
 
 void loop() {
   M5.update();
+  if (!screen_awake && (M5.BtnA.wasPressed() || M5.BtnB.wasPressed())) {
+    wakeScreen();
+    drawReady();
+    delay(250);
+    return;
+  }
   if (M5.BtnA.wasPressed()) {
     if (WiFi.status() != WL_CONNECTED && !connectWiFi()) {
       delay(1000);
@@ -462,5 +552,6 @@ void loop() {
     }
     delay(1000);
   }
+  sleepScreen();
   delay(10);
 }
