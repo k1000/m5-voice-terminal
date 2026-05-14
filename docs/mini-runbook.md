@@ -21,6 +21,7 @@ pip install -r requirements-mini.txt
 Pi worker requirements:
 
 ```sh
+PATH=/opt/homebrew/bin:$PATH ffmpeg -version | head -1
 PATH=/opt/homebrew/bin:$PATH node --version
 PATH=/opt/homebrew/bin:$PATH pi --version
 PATH=/opt/homebrew/bin:$PATH make test

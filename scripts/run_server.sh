@@ -4,6 +4,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Non-interactive ssh/launchd shells on mini may not include Homebrew.
+if [ -d /opt/homebrew/bin ]; then
+  export PATH="/opt/homebrew/bin:$PATH"
+fi
+
 if [ -f .env ]; then
   set -a
   # shellcheck disable=SC1091
