@@ -104,7 +104,7 @@ Completed job response shape includes:
 }
 ```
 
-If sentiment is omitted, the server infers a simple `happy`, `neutral`, or `sad` fallback from the result text/status. If an agent result includes `image_prompt`, the server generates a 135×135 little-endian RGB565 image at `/image/<job_id>` and returns it as `image_url`; the Stick displays that image instead of the bundled sentiment face. The server keeps up to three worker-provided options and appends `New request` as the fourth option.
+If sentiment is omitted, the server infers a simple `happy`, `neutral`, or `sad` fallback from the result text/status. If an agent result includes `image_prompt`, the server queues background generation of a cached 135×135 little-endian RGB565 image at `/image/<job_id>` instead of blocking the voice response; the Stick displays a bundled sentiment face until an image URL is available on a later poll. The server keeps up to three worker-provided options and appends `New request` as the fourth option.
 
 ## Stick firmware
 

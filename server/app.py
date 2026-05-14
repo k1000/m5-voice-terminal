@@ -1,11 +1,13 @@
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any, Literal
 from uuid import uuid4
+import hashlib
 import json
 import os
+import shutil
 import sys
 import time
 import unicodedata
@@ -26,6 +28,7 @@ DATA_DIR = Path(os.environ.get("M5_VOICE_DATA_DIR", Path(__file__).resolve().par
 JOBS_FILE = DATA_DIR / "agent_jobs.json"
 AUDIO_DIR = DATA_DIR / "audio"
 IMAGE_DIR = DATA_DIR / "images"
+IMAGE_CACHE_DIR = IMAGE_DIR / "cache"
 TTS_VOICE = os.environ.get("TTS_VOICE", "M1")
 TTS_LANG = os.environ.get("TTS_LANG", "en")
 TTS_SAMPLE_RATE = int(os.environ.get("TTS_SAMPLE_RATE", "44100"))
@@ -91,6 +94,7 @@ def _ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _load_jobs_unlocked() -> list[AgentJob]:
@@ -182,14 +186,34 @@ def cleanup_old_audio(keep_job_id: str | None = None) -> int:
     return removed
 
 
+def image_cache_key(prompt: str) -> str:
+    """Stable cache key for generated Stick-sized images."""
+    normalized = " ".join(prompt.strip().lower().split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+
+
 def generate_response_image(prompt: str, job_id: str) -> tuple[str | None, dict[str, Any]]:
-    """Generate a 135x135 RGB565 image and return its download URL if successful."""
+    """Generate or reuse a 135x135 RGB565 image and return its download URL if successful."""
+    _ensure_data_dir()
     started = time.perf_counter()
-    metrics: dict[str, Any] = {"server_image_prompt": prompt[:180]}
-    helper = Path("/Users/kamil/.pi/agent/skills/minimax-image/scripts/minimax_image.py")
+    cache_key = image_cache_key(prompt)
+    metrics: dict[str, Any] = {"server_image_prompt": prompt[:180], "server_image_cache_key": cache_key}
+    helper = Path(os.environ.get("MINIMAX_IMAGE_HELPER", "/Users/kamil/.pi/agent/skills/minimax-image/scripts/minimax_image.py"))
     jpg_path = IMAGE_DIR / f"{job_id}.jpg"
     rgb565_path = IMAGE_DIR / f"{job_id}.rgb565"
+    cache_rgb565_path = IMAGE_CACHE_DIR / f"{cache_key}.rgb565"
+    cache_jpg_path = IMAGE_CACHE_DIR / f"{cache_key}.jpg"
     try:
+        if cache_rgb565_path.exists():
+            shutil.copyfile(cache_rgb565_path, rgb565_path)
+            metrics.update({
+                "server_image_s": round(time.perf_counter() - started, 3),
+                "server_image_size": "135x135",
+                "server_image_format": "rgb565-le",
+                "server_image_cached": True,
+            })
+            return f"/image/{job_id}", metrics
+
         if not helper.exists():
             raise RuntimeError(f"MiniMax image helper not found: {helper}")
         import subprocess
@@ -204,15 +228,18 @@ def generate_response_image(prompt: str, job_id: str) -> tuple[str | None, dict[
 
         with Image.open(jpg_path) as image:
             image = image.convert("RGB").resize((135, 135), Image.Resampling.LANCZOS)
+            image.save(cache_jpg_path, quality=95)
             raw = bytearray()
             for r, g, b in image.getdata():
                 value = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
                 raw.extend(value.to_bytes(2, "little"))
-        rgb565_path.write_bytes(raw)
+        cache_rgb565_path.write_bytes(raw)
+        shutil.copyfile(cache_rgb565_path, rgb565_path)
         metrics.update({
             "server_image_s": round(time.perf_counter() - started, 3),
             "server_image_size": "135x135",
             "server_image_format": "rgb565-le",
+            "server_image_cached": False,
         })
         return f"/image/{job_id}", metrics
     except Exception as exc:
@@ -221,6 +248,25 @@ def generate_response_image(prompt: str, job_id: str) -> tuple[str | None, dict[
             "server_image_error": repr(exc),
         })
         return None, metrics
+
+
+def schedule_response_image(prompt: str, job_id: str) -> None:
+    """Generate response image in the background so voice answers are not delayed."""
+    def worker() -> None:
+        image_url, image_metrics = generate_response_image(prompt, job_id)
+        with _jobs_lock:
+            jobs = _load_jobs_unlocked()
+            for index, job in enumerate(jobs):
+                if job.id == job_id:
+                    if image_url:
+                        job.image_url = image_url
+                    job.metrics.update(image_metrics)
+                    job.updated_at = utc_now()
+                    jobs[index] = job
+                    _save_jobs_unlocked(jobs)
+                    return
+
+    Thread(target=worker, name=f"image-{job_id}", daemon=True).start()
 
 
 def sanitize_tts_text(text: str) -> str:
@@ -531,6 +577,7 @@ def get_agent_job(job_id: str) -> AgentJob:
 def set_agent_job_result(job_id: str, result: AgentResult) -> AgentJob:
     """Store Pi/agent output so the device or UI can retrieve it."""
     result_post_start = time.perf_counter()
+    image_prompt_to_schedule: str | None = None
     with _jobs_lock:
         jobs = _load_jobs_unlocked()
         for index, job in enumerate(jobs):
@@ -544,9 +591,11 @@ def set_agent_job_result(job_id: str, result: AgentResult) -> AgentJob:
                 job.options = normalize_options(result.options)
                 job.metrics.update(result.metrics)
                 if result.status == "done" and result.image_prompt and not job.image_url:
-                    image_url, image_metrics = generate_response_image(result.image_prompt, job.id)
-                    job.image_url = image_url
-                    job.metrics.update(image_metrics)
+                    image_prompt_to_schedule = result.image_prompt
+                    job.metrics.update({
+                        "server_image_prompt": result.image_prompt[:180],
+                        "server_image_queued": True,
+                    })
                 if result.status == "done" and result.text and not job.audio_url:
                     audio_url, tts_metrics = generate_tts_audio(result.text, job.id)
                     job.audio_url = audio_url or None
@@ -561,5 +610,7 @@ def set_agent_job_result(job_id: str, result: AgentResult) -> AgentJob:
                 job.updated_at = now.isoformat(timespec="seconds")
                 jobs[index] = job
                 _save_jobs_unlocked(jobs)
+                if image_prompt_to_schedule:
+                    schedule_response_image(image_prompt_to_schedule, job.id)
                 return job
     raise HTTPException(status_code=404, detail="job not found")
