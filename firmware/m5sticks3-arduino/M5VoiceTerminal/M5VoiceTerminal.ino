@@ -525,6 +525,9 @@ static bool streamJobResult(const String &jobId) {
 }
 
 static bool pollJobResult(const String &jobId) {
+  // Polling fallback: used when WebSocket stream fails.  Set USE_POLLING_FALLBACK
+  // to 1 in config.h to force polling instead of WebSocket.
+#ifdef USE_POLLING_FALLBACK
   const String url = SERVER_BASE_URL + "/agent/jobs/" + jobId;
   const char spin[] = {'|', '/', '-', '\\'};
   uint32_t start = millis();
@@ -562,7 +565,6 @@ static bool pollJobResult(const String &jobId) {
         delay(700);
         playAudioUrl(audioUrl);
         drawJobResponse(sentiment, result, imageUrl);
-        // Re-draw response image/face after audio playback.
       }
       JsonArray options = doc["options"].as<JsonArray>();
       String selected = chooseOption(options);
@@ -600,6 +602,10 @@ static bool pollJobResult(const String &jobId) {
 
   drawStatus("Timeout", "Job " + jobId);
   return false;
+#else
+  drawStatus("Poll disabled", "WS only");
+  return false;
+#endif
 }
 
 static String postTextCommand(const String &text) {
