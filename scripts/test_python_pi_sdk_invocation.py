@@ -10,6 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 THRESHOLD_MS = float(os.environ.get("PI_STARTUP_THRESHOLD_MS", "5000"))
+JS_RUNTIME = os.environ.get("PI_JS_RUNTIME") or os.environ.get("JS_RUNTIME") or "node"
 
 payload = {
     "dryRun": True,
@@ -20,7 +21,7 @@ payload = {
 }
 
 result = subprocess.run(
-    ["node", str(ROOT / "scripts" / "pi_sdk_once.mjs")],
+    [JS_RUNTIME, str(ROOT / "scripts" / "pi_sdk_once.mjs")],
     input=json.dumps(payload),
     text=True,
     capture_output=True,

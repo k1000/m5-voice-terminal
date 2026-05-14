@@ -23,11 +23,13 @@ Pi worker requirements:
 ```sh
 PATH=/opt/homebrew/bin:$PATH ffmpeg -version | head -1
 PATH=/opt/homebrew/bin:$PATH node --version
+PATH=/opt/homebrew/bin:$PATH bun --version  # optional but preferred by run_worker.sh when present
 PATH=/opt/homebrew/bin:$PATH pi --version
 PATH=/opt/homebrew/bin:$PATH make test
+PATH=/opt/homebrew/bin:$PATH make test JS_RUNTIME=bun  # optional Bun SDK smoke test
 ```
 
-If `node` or `pi` is missing, install/configure Pi on mini before using `VOICE_WORKER_BACKEND=pi-sdk-full`. The server can still run without the worker for `/health`, `/models`, and upload/STT testing.
+If `node` or `pi` is missing, install/configure Pi on mini before using `VOICE_WORKER_BACKEND=pi-sdk-full`. Bun is optional; when installed, `scripts/run_worker.sh` uses it for the Pi SDK helper via `PI_JS_RUNTIME=bun`. The server can still run without the worker for `/health`, `/models`, and upload/STT testing.
 
 ## Start server
 
@@ -60,6 +62,7 @@ Defaults:
 - `VOICE_WORKER_BACKEND=pi-sdk-full`
 - `PI_WORKER_MODEL=minimax/MiniMax-M2.7-highspeed`
 - `PI_WORKER_THINKING=off`
+- `PI_JS_RUNTIME=bun` if `bun` is on PATH, otherwise Node
 
 ## Point StickS3 at mini
 

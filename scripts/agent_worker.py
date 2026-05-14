@@ -188,6 +188,11 @@ def worker_tools() -> list[str]:
     return [tool.strip() for tool in extra_tools.split(",") if tool.strip()]
 
 
+def js_runtime() -> str:
+    """Return JS runtime for the Pi SDK helper; set PI_JS_RUNTIME=bun to use Bun."""
+    return os.environ.get("PI_JS_RUNTIME") or os.environ.get("JS_RUNTIME") or "node"
+
+
 def run_pi_sdk(prompt: str, timeout: int, history: list[dict[str, str]] | None = None, full_resources: bool = False) -> str:
     """Invoke Pi programmatically through its SDK from this Python worker."""
     model = os.environ.get("PI_WORKER_MODEL", "minimax/MiniMax-M2.7-highspeed")
@@ -203,7 +208,7 @@ def run_pi_sdk(prompt: str, timeout: int, history: list[dict[str, str]] | None =
     }
     script = os.path.join(os.path.dirname(__file__), "pi_sdk_once.mjs")
     result = subprocess.run(
-        ["node", script],
+        [js_runtime(), script],
         input=json.dumps(payload),
         text=True,
         capture_output=True,

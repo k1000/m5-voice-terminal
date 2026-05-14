@@ -57,7 +57,7 @@ cp firmware/m5sticks3-arduino/M5VoiceTerminal/config.h.example \
 
 Voice/text commands are queued for a local Python worker. By default the worker uses `VOICE_WORKER_BACKEND=pi-sdk-full`, invoking Pi programmatically from Python with extensions/skills/prompts/context files loaded. Set `VOICE_WORKER_BACKEND=pi-sdk` for a faster minimal SDK path, `VOICE_WORKER_BACKEND=minimax-direct` for the direct MiniMax shortcut, or `VOICE_WORKER_BACKEND=pi` to use the slower `pi -p` CLI path.
 
-In `pi-sdk-full` mode, if `PI_WORKER_TOOLS` is unset, the worker currently enables `web_fetch,web_search,read,bash,grep,find,ls`.
+In `pi-sdk-full` mode, if `PI_WORKER_TOOLS` is unset, the worker currently enables `web_fetch,web_search,read,bash,grep,find,ls`. The SDK helper runs with `PI_JS_RUNTIME`/`JS_RUNTIME` if set (`node` by default); `scripts/run_worker.sh` prefers `bun` automatically when available.
 
 ```sh
 env VOICE_WORKER_BACKEND=pi-sdk-full \
@@ -160,6 +160,8 @@ Fast Pi SDK startup smoke test:
 
 ```sh
 make test
+# test the SDK helper under Bun instead of Node:
+make test JS_RUNTIME=bun
 # optional real model call after SDK startup:
 node scripts/test_pi_programmatic_start.mjs --prompt
 ```

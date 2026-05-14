@@ -21,6 +21,10 @@ if [ ! -d .venv ]; then
   exit 1
 fi
 
+if [ -z "${PI_JS_RUNTIME:-}" ] && command -v bun >/dev/null 2>&1; then
+  export PI_JS_RUNTIME=bun
+fi
+
 export VOICE_WORKER_BACKEND="${VOICE_WORKER_BACKEND:-pi-sdk-full}"
 export PI_WORKER_MODEL="${PI_WORKER_MODEL:-minimax/MiniMax-M2.7-highspeed}"
 export PI_WORKER_THINKING="${PI_WORKER_THINKING:-off}"
