@@ -45,15 +45,16 @@ _subscribers_lock = asyncio.Lock()
 # thread and consumed + cleared by _notify_subscribers.
 _pending_image_bin: dict[str, bytes] = {}
 _pending_image_lock = Lock()
-# Thread pool for parallel image + audio generation.
-_thread_pool: ThreadPoolExecutor | None = None
+# Shared thread pool for parallel image + audio generation.
+_tp_executor: ThreadPoolExecutor | None = None
 
 
 def _thread_pool() -> ThreadPoolExecutor:
-    global _thread_pool
-    if _thread_pool is None:
-        _thread_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="m5gen-")
-    return _thread_pool
+    """Return the shared ThreadPoolExecutor, creating it on first call."""
+    global _tp_executor
+    if _tp_executor is None:
+        _tp_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="m5gen-")
+    return _tp_executor
 
 
 class CommandRequest(BaseModel):
@@ -287,23 +288,32 @@ def _image_helpers() -> list[tuple[Path, str, list[str]]]:
     """Return (helper_path, backend_name, extra_args) ordered by priority.
 
     Tries in order:
-      1. MLX SDXL Turbo via scripts/mlx_image.py  (default, offline, fast)
-      2. MiniMax API via MINIMAX_IMAGE_HELPER         (online, better quality)
+      1. Z-Image-Turbo via scripts/zimage_turbo.py  (best quality, offline, ~13s)
+      2. MLX SDXL Turbo via scripts/mlx_image.py    (toy-like, offline, fast)
+      3. MiniMax API via MINIMAX_IMAGE_HELPER        (online, better quality)
 
-    Set MLX_IMAGE_HELPER="" to disable MLX.  Set MLX_IMAGE_MODEL to override the
-    default sdxl-turbo model.  Set MINIMAX_IMAGE_HELPER to override MiniMax path.
+    Set ZIMAGE_TURBO_HELPER="" to disable Z-Image-Turbo.  Set ZIMAGE_TURBO_STEPS
+    to override steps (default 4).  Set MLX_IMAGE_HELPER="" to disable MLX.
     """
     helpers: list[tuple[Path, str, list[str]]] = []
 
-    # MLX helper — default unless explicitly disabled.
-    mlx_disabled = os.environ.get("MLX_IMAGE_HELPER", "") == ""
-    if not mlx_disabled:
-        mlx_helper = os.environ.get("MLX_IMAGE_HELPER", "")
-        path = Path(mlx_helper) if mlx_helper else Path(__file__).parents[1] / "scripts" / "mlx_image.py"
-        if path.exists():
+    # Z-Image-Turbo via mflux — best quality on Apple Silicon.
+    # Disabled only when explicitly set to ""; otherwise added by default.
+    zimage_env = os.environ.get("ZIMAGE_TURBO_HELPER")
+    if zimage_env != "":  # not explicitly disabled
+        zimage_path = Path(zimage_env) if zimage_env else Path(__file__).parents[1] / "scripts" / "zimage_turbo.py"
+        if zimage_path.exists():
+            steps = os.environ.get("ZIMAGE_TURBO_STEPS", "4")
+            helpers.append((zimage_path, "zimage_turbo", ["--steps", steps]))
+
+    # MLX helper — disabled only when MLX_IMAGE_HELPER is explicitly set to "".
+    mlx_env = os.environ.get("MLX_IMAGE_HELPER")
+    if mlx_env != "":  # not explicitly disabled
+        mlx_path = Path(mlx_env) if mlx_env else Path(__file__).parents[1] / "scripts" / "mlx_image.py"
+        if mlx_path.exists():
             model = os.environ.get("MLX_IMAGE_MODEL", "stabilityai/sdxl-turbo")
             steps = os.environ.get("MLX_IMAGE_STEPS", "4")
-            helpers.append((path, "mlx", ["--model", model, "--steps", steps]))
+            helpers.append((mlx_path, "mlx", ["--model", model, "--steps", steps]))
 
     # MiniMax API helper — used as fallback.
     minimax_path = Path(os.environ.get(
