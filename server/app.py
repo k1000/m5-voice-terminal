@@ -196,6 +196,48 @@ def image_cache_key(prompt: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
 
 
+def rle_compress(data: bytes) -> tuple[bytes, bool]:
+    """RLE-compress at 16-bit pixel level for RGB565 images.
+
+    Each run of identical pixels (2 bytes, little-endian) is encoded as:
+      [count, low_byte, high_byte]
+
+    count >= 2:  repeat the 16-bit pixel count times
+    0x00, 1, lo, hi:  escape + count 1 + pixel bytes  (literal single pixel)
+
+    The Stick detects compression by the b"RLE\\x01" header and decodes
+    pixel-by-pixel (2 bytes per pixel).
+
+    Returns (compressed, did_compress).  Falls back to raw if compression does
+    not reduce size (including the 4-byte header overhead).
+    """
+    if len(data) % 2 != 0:
+        return data, False  # must be a multiple of 2 (RGB565 pixels)
+    encoded = bytearray()
+    i = 0
+    while i < len(data):
+        lo, hi = data[i], data[i + 1]
+        run = 1
+        while (i + run * 2) < len(data) and data[i + run * 2] == lo and data[i + run * 2 + 1] == hi and run < 255:
+            run += 1
+        if run >= 2:
+            encoded.append(run)
+            encoded.append(lo)
+            encoded.append(hi)
+        else:
+            # Literal single pixel — escape to avoid misreading lo as a repeat count.
+            encoded.append(0x00)
+            encoded.append(1)
+            encoded.append(lo)
+            encoded.append(hi)
+        i += run * 2
+
+    compressed = bytes(encoded)
+    if len(compressed) + 4 >= len(data):
+        return data, False
+    return bytes([0x52, 0x4C, 0x45, 0x01]) + compressed, True
+
+
 def generate_response_image(prompt: str, job_id: str) -> tuple[str | None, dict[str, Any]]:
     """Generate or reuse a 135x135 RGB565 image and return its download URL if successful."""
     _ensure_data_dir()
@@ -209,11 +251,13 @@ def generate_response_image(prompt: str, job_id: str) -> tuple[str | None, dict[
     cache_jpg_path = IMAGE_CACHE_DIR / f"{cache_key}.jpg"
     try:
         if cache_rgb565_path.exists():
+            cached_data = cache_rgb565_path.read_bytes()
+            is_rle = cached_data[:4] == b"RLE\x01"
             shutil.copyfile(cache_rgb565_path, rgb565_path)
             metrics.update({
                 "server_image_s": round(time.perf_counter() - started, 3),
                 "server_image_size": "135x135",
-                "server_image_format": "rgb565-le",
+                "server_image_format": "rgb565-le-rle" if is_rle else "rgb565-le",
                 "server_image_cached": True,
             })
             return f"/image/{job_id}", metrics
@@ -237,12 +281,16 @@ def generate_response_image(prompt: str, job_id: str) -> tuple[str | None, dict[
             for r, g, b in image.getdata():
                 value = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
                 raw.extend(value.to_bytes(2, "little"))
-        cache_rgb565_path.write_bytes(raw)
+        compressed, did_compress = rle_compress(bytes(raw))
+        cache_rgb565_path.write_bytes(compressed)
         shutil.copyfile(cache_rgb565_path, rgb565_path)
         metrics.update({
             "server_image_s": round(time.perf_counter() - started, 3),
             "server_image_size": "135x135",
-            "server_image_format": "rgb565-le",
+            "server_image_format": "rgb565-le-rle" if did_compress else "rgb565-le",
+            "server_image_compressed": did_compress,
+            "server_image_raw_bytes": len(raw),
+            "server_image_compressed_bytes": len(compressed),
             "server_image_cached": False,
         })
         return f"/image/{job_id}", metrics

@@ -131,41 +131,81 @@ static bool drawRemoteImageUrl(const String &imageUrl, const String &line = "") 
     http.end();
     return false;
   }
-  const int expected = WOLF_FACE_WIDTH * WOLF_FACE_HEIGHT * 2;
-  int len = http.getSize();
-  if (len != expected) {
+
+  const int expected = WOLF_FACE_WIDTH * WOLF_FACE_HEIGHT * 2;  // 36450
+  // Download into a buffer.  The compressed stream is smaller but we allocate
+  // the full decoded size as a safe upper bound.
+  uint8_t *raw = (uint8_t *)ps_malloc(expected);
+  if (!raw) {
     http.end();
     return false;
   }
-  uint8_t *bytes = (uint8_t *)ps_malloc(expected);
-  if (!bytes) {
-    http.end();
-    return false;
-  }
+
   WiFiClient *stream = http.getStreamPtr();
-  int readTotal = 0;
+  int downloaded = 0;
   uint32_t started = millis();
-  while (http.connected() && readTotal < expected && millis() - started < 10000) {
-    size_t available = stream->available();
-    if (available) {
-      int n = stream->readBytes(bytes + readTotal, min((int)available, expected - readTotal));
-      readTotal += n;
+  while (http.connected() && downloaded < expected && millis() - started < 10000) {
+    size_t avail = stream->available();
+    if (avail) {
+      int n = stream->readBytes(raw + downloaded, min((int)avail, expected - downloaded));
+      downloaded += n;
     } else {
       delay(1);
     }
   }
   http.end();
-  if (readTotal != expected) {
-    free(bytes);
+
+  // Check for RLE header.  If present, decode in-place into a local buffer.
+  uint8_t *pixels = raw;
+  bool do_free_pixels = false;
+  if (downloaded >= 4 && raw[0] == 0x52 && raw[1] == 0x4C && raw[2] == 0x45 && raw[3] == 0x01) {
+    uint8_t *decoded = (uint8_t *)ps_malloc(expected);
+    if (!decoded) {
+      free(raw);
+      return false;
+    }
+    int di = 0;
+    for (int i = 4; i < downloaded && di < expected; ) {
+      uint8_t count = raw[i++];
+      if (count == 0x00) {
+        // Escape: [0x00, N, lo, hi] — write N copies of the pixel.
+        count = raw[i++];  // should be 1
+        uint8_t lo = raw[i++];
+        uint8_t hi = raw[i++];
+        for (uint8_t k = 0; k < count && di < expected; k++) {
+          decoded[di++] = lo;
+          decoded[di++] = hi;
+        }
+      } else {
+        // Repeat: [count, lo, hi] — repeat the pixel count times.
+        uint8_t lo = raw[i++];
+        uint8_t hi = raw[i++];
+        for (uint8_t k = 0; k < count && di < expected; k++) {
+          decoded[di++] = lo;
+          decoded[di++] = hi;
+        }
+      }
+    }
+    pixels = decoded;
+    do_free_pixels = true;
+    free(raw);
+    if (di != expected) {
+      free(decoded);
+      return false;
+    }
+  } else if (downloaded != expected) {
+    free(raw);
     return false;
   }
+
   wakeScreen();
   M5.Display.clear(BLACK);
   bool oldSwap = M5.Display.getSwapBytes();
   M5.Display.setSwapBytes(true);
-  M5.Display.pushImage(0, 0, WOLF_FACE_WIDTH, WOLF_FACE_HEIGHT, (uint16_t *)bytes);
+  M5.Display.pushImage(0, 0, WOLF_FACE_WIDTH, WOLF_FACE_HEIGHT, (uint16_t *)pixels);
   M5.Display.setSwapBytes(oldSwap);
-  free(bytes);
+  if (do_free_pixels) free(pixels);
+  else free(raw);
   M5.Display.setTextSize(2);
   M5.Display.setTextColor(WHITE, BLACK);
   drawWrapped(line, 4, 142, 10, 18);
