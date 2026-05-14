@@ -178,6 +178,15 @@ Latency reporting:
 ./scripts/latency_report.py --base-url http://127.0.0.1:8010
 ```
 
+## Running on mini
+
+Use `docs/mini-runbook.md` for Mac mini setup and operation. The helper scripts are:
+
+```sh
+./scripts/run_server.sh
+./scripts/run_worker.sh
+```
+
 ## Safety posture
 
 The default voice worker should run with inspection-oriented tools only. The current `pi-sdk-full` default includes web tools plus `read,bash,grep,find,ls`; do not add edit/write/git tools for voice commands. For stricter operation, set `PI_WORKER_TOOLS` explicitly to a smaller non-empty list, or use `VOICE_WORKER_BACKEND=pi-sdk` with `PI_WORKER_TOOLS` unset for no tools.
