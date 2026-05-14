@@ -6,6 +6,7 @@ from typing import Any, Literal
 from uuid import uuid4
 import json
 import os
+import sys
 import time
 import unicodedata
 
@@ -193,7 +194,7 @@ def generate_response_image(prompt: str, job_id: str) -> tuple[str | None, dict[
             raise RuntimeError(f"MiniMax image helper not found: {helper}")
         import subprocess
         subprocess.run(
-            ["python3", str(helper), prompt, "--square", "135", "--output", str(jpg_path)],
+            [sys.executable, str(helper), prompt, "--square", "135", "--output", str(jpg_path)],
             text=True,
             capture_output=True,
             check=True,
