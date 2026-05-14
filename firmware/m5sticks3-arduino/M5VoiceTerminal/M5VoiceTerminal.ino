@@ -27,6 +27,9 @@ static volatile bool wsJobDone = false;
 static volatile bool wsJobSuccess = false;
 static volatile bool wsJobConnected = false;
 static uint32_t wsLastActivityMs = 0;
+static bool wsBinaryDisplayed = false;  // set true when binary image pushed to display
+static int wsImageW = WOLF_FACE_WIDTH;   // width for next binary frame
+static int wsImageH = WOLF_FACE_HEIGHT;  // height for next binary frame
 static constexpr uint32_t WS_TIMEOUT_MS = 120000;
 static constexpr uint32_t WS_PING_INTERVAL_MS = 10000;
 static constexpr uint32_t SCREEN_SLEEP_MS = 20000;
@@ -277,6 +280,10 @@ static void wsEventHandler(WStype_t type, uint8_t *payload, size_t length) {
       wsJobDoc.clear();
       DeserializationError err = deserializeJson(wsJobDoc, payload, length);
       if (err) break;
+      // Extract binary frame dimensions from metadata if present (server sends these
+      // just before a binary frame so the Stick knows what size to expect).
+      if (wsJobDoc.containsKey("image_w")) wsImageW = wsJobDoc["image_w"].as<int>();
+      if (wsJobDoc.containsKey("image_h")) wsImageH = wsJobDoc["image_h"].as<int>();
       const char *status = wsJobDoc["status"] | "";
       if (strcmp(status, "done") == 0 || strcmp(status, "failed") == 0) {
         wsJobDone = true;
@@ -284,6 +291,26 @@ static void wsEventHandler(WStype_t type, uint8_t *payload, size_t length) {
       }
       break;
     }
+    case WStype_BIN:
+      // Binary frame: raw RGB565 image pushed directly from server over WebSocket.
+      // wsImageW/H were set from the JSON metadata sent just before this frame.
+      wsLastActivityMs = millis();
+      if (length == (size_t)(wsImageW * wsImageH * 2)) {
+        wsBinaryDisplayed = true;
+        wakeScreen();
+        M5.Display.clear(BLACK);
+        bool oldSwap = M5.Display.getSwapBytes();
+        M5.Display.setSwapBytes(true);
+        M5.Display.pushImage(0, 0, wsImageW, wsImageH, (uint16_t *)payload);
+        M5.Display.setSwapBytes(oldSwap);
+        if (wsJobDoc.containsKey("result_text")) {
+          String result = wsJobDoc["result_text"].as<String>();
+          M5.Display.setTextSize(2);
+          M5.Display.setTextColor(WHITE, BLACK);
+          drawWrapped(result, 4, wsImageH + 4, 10, 18);
+        }
+      }
+      break;
     case WStype_PONG:
       wsLastActivityMs = millis();
       break;
@@ -484,6 +511,7 @@ static bool streamJobResult(const String &jobId) {
   wsJobSuccess = false;
   wsJobConnected = false;
   wsLastActivityMs = millis();
+  wsBinaryDisplayed = false;
   wsJobDoc.clear();
 
   wsClient.disconnect();
@@ -506,17 +534,20 @@ static bool streamJobResult(const String &jobId) {
         lastPingMs = millis();
       }
 
-      // Animate waiting face while job is in progress.
-      uint32_t elapsed = millis() - wsLastActivityMs + 1;
-      wakeScreen();
-      M5.Display.clear(BLACK);
-      drawFaceImage((elapsed / 3000) % 2 == 0 ? "waiting-left" : "waiting-right");
-      M5.Display.setTextSize(2);
-      M5.Display.setTextColor(YELLOW, BLACK);
-      drawWrapped(String("Listening ") + spin[i++ % 4], 4, 142, 10, 18);
-      M5.Display.setTextSize(1);
-      M5.Display.setTextColor(WHITE, BLACK);
-      drawWrapped("Job " + jobId, 4, 200, 18, 12);
+      // Animate waiting face only if binary image hasn't arrived yet.
+      // When wsEventHandler receives binary, it writes directly to display.
+      if (!wsBinaryDisplayed) {
+        uint32_t elapsed = millis() - wsLastActivityMs + 1;
+        wakeScreen();
+        M5.Display.clear(BLACK);
+        drawFaceImage((elapsed / 3000) % 2 == 0 ? "waiting-left" : "waiting-right");
+        M5.Display.setTextSize(2);
+        M5.Display.setTextColor(YELLOW, BLACK);
+        drawWrapped(String("Listening ") + spin[i++ % 4], 4, 142, 10, 18);
+        M5.Display.setTextSize(1);
+        M5.Display.setTextColor(WHITE, BLACK);
+        drawWrapped("Job " + jobId, 4, 200, 18, 12);
+      }
     }
     delay(20);
   }
@@ -534,17 +565,20 @@ static bool streamJobResult(const String &jobId) {
     return false;
   }
 
-  // ---- Job succeeded, same behaviour as pollJobResult ----
+  // ---- Job succeeded ----
+  // If binary image was received over WebSocket, it was already displayed by
+  // wsEventHandler.  Pass empty imageUrl so we skip the HTTP GET path.
   String result = wsJobDoc["result_text"] | "[done: no text]";
   String sentiment = wsJobDoc["sentiment"] | "neutral";
   String audioUrl = wsJobDoc["audio_url"] | "";
-  String imageUrl = wsJobDoc["image_url"] | "";
+  // imageUrl is deliberately omitted when wsBinaryDisplayed to avoid re-fetch.
+  String displayImageUrl = wsBinaryDisplayed ? String("") : (wsJobDoc["image_url"] | String(""));
 
-  drawJobResponse(sentiment, result, imageUrl);
+  drawJobResponse(sentiment, result, displayImageUrl);
   if (audioUrl.length()) {
     delay(700);
     playAudioUrl(audioUrl);
-    drawJobResponse(sentiment, result, imageUrl);
+    drawJobResponse(sentiment, result, displayImageUrl);
   }
 
   JsonArray options = wsJobDoc["options"].as<JsonArray>();

@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -40,6 +41,19 @@ _tts_engine: Any | None = None
 _jobs_lock = Lock()
 _job_subscribers: dict[str, list[WebSocket]] = {}
 _subscribers_lock = asyncio.Lock()
+# Pending binary image data indexed by job_id.  Filled by the image generation
+# thread and consumed + cleared by _notify_subscribers.
+_pending_image_bin: dict[str, bytes] = {}
+_pending_image_lock = Lock()
+# Thread pool for parallel image + audio generation.
+_thread_pool: ThreadPoolExecutor | None = None
+
+
+def _thread_pool() -> ThreadPoolExecutor:
+    global _thread_pool
+    if _thread_pool is None:
+        _thread_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="m5gen-")
+    return _thread_pool
 
 
 class CommandRequest(BaseModel):
@@ -236,6 +250,37 @@ def rle_compress(data: bytes) -> tuple[bytes, bool]:
     if len(compressed) + 4 >= len(data):
         return data, False
     return bytes([0x52, 0x4C, 0x45, 0x01]) + compressed, True
+
+
+def rle_decompress(data: bytes) -> bytes:
+    """Decompress RLE data produced by rle_compress.
+
+    Format:
+      [count, lo, hi]       → repeat pixel (lo,hi) count times  (count >= 2)
+      [0x00, 1, lo, hi]    → escape for literal single pixel
+    """
+    result = bytearray()
+    i = 0
+    while i < len(data):
+        count = data[i]
+        i += 1
+        if count == 0:
+            # Escape: next byte is literal pixel count (always 1 in practice).
+            literal_count = data[i]
+            i += 1
+            for _ in range(literal_count):
+                result.append(data[i])
+                result.append(data[i + 1])
+                i += 2
+        else:
+            # Repeat run: pixel bytes follow.
+            result.append(data[i])
+            result.append(data[i + 1])
+            pixel = int.from_bytes([data[i], data[i + 1]], "little")
+            for _ in range(count):
+                result.extend(pixel.to_bytes(2, "little"))
+            i += 2
+    return bytes(result)
 
 
 def _image_helpers() -> list[tuple[Path, str, list[str]]]:
@@ -678,29 +723,51 @@ def _get_job_unlocked(jobs: list[AgentJob], job_id: str) -> AgentJob | None:
 
 
 async def _notify_subscribers(job_id: str) -> None:
-    """Push the final job result to every WebSocket subscriber for *job_id*.
+    """Push job result to every WebSocket subscriber for *job_id*.
 
-    Sends the payload followed by a _ws_close marker so the handler exits its
-    receive loop and closes the connection.  We do *not* call ws.close() here
-    because the handler's finally-block also closes — we make both sides
-    idempotent with try/except.
+    If a binary image was generated, it is sent as a binary WebSocket frame first
+    (Stick displays it immediately).  Then the final JSON is sent and the
+    connection is closed.  We do *not* call ws.close() here because the
+    handler's finally-block also closes — both sides are idempotent.
     """
     async with _subscribers_lock:
         sockets = _job_subscribers.pop(job_id, [])
     if not sockets:
         return
+
+    # Retrieve and clear pending binary image.
+    pending_bin: bytes | None = None
+    with _pending_image_lock:
+        pending_bin = _pending_image_bin.pop(job_id, None)
+
+    # Load job state for the final JSON.
     with _jobs_lock:
         jobs = _load_jobs_unlocked()
     job = _get_job_unlocked(jobs, job_id)
     if job is None:
         return
+
+    # Push binary image frame first (Stick displays immediately).
+    if pending_bin is not None:
+        payload = job.model_dump()
+        payload["image_w"] = 135  # RGB565 width
+        payload["image_h"] = 135  # RGB565 height
+        for ws in sockets:
+            try:
+                # Send JSON metadata first so Stick knows image dimensions.
+                await ws.send_json(payload)
+                # Send raw binary frame: Stick writes it directly to display.
+                await ws.send_bytes(pending_bin)
+            except Exception:
+                pass
+
+    # Push final JSON (with audio_url) and close marker.
     payload = job.model_dump()
     for ws in sockets:
         try:
             await ws.send_json(payload)
             await ws.send_json({"_ws_close": True})
         except Exception:
-            # Socket already closed or errored — handler's finally will clean up.
             pass
 
 
@@ -777,9 +844,38 @@ def get_agent_job(job_id: str) -> AgentJob:
 
 @app.post("/agent/jobs/{job_id}/result", response_model=AgentJob)
 def set_agent_job_result(job_id: str, result: AgentResult, background_tasks: BackgroundTasks) -> AgentJob:
-    """Store Pi/agent output so the device or UI can retrieve it."""
+    """Store Pi/agent output so the device or UI can retrieve it.
+
+    Image generation and TTS run in parallel via a ThreadPoolExecutor.
+    When the image is ready it is pushed as a binary WebSocket frame immediately.
+    When TTS is ready the final JSON is sent to complete the job.
+    """
     result_post_start = time.perf_counter()
-    image_prompt_to_schedule: str | None = None
+    has_image = result.status == "done" and result.image_prompt and not result.image_url
+    has_tts = result.status == "done" and result.text and not result.audio_url
+
+    # Submit parallel work.
+    image_future = None
+    tts_future = None
+    if has_image:
+        image_future = _thread_pool().submit(_generate_image_for_job, job_id, result.image_prompt)
+    if has_tts:
+        tts_future = _thread_pool().submit(_generate_tts_for_job, job_id, result.text)
+
+    # Collect results.  Both futures run in parallel; wait for each independently.
+    tts_metrics: dict[str, Any] = {}
+    if tts_future is not None:
+        tts_metrics = tts_future.result()
+
+    # Save pending binary image so _notify_subscribers can push it as a binary frame.
+    pending_bin: bytes | None = None
+    if image_future is not None:
+        pending_bin = image_future.result()  # None if generation failed
+        if pending_bin is not None:
+            with _pending_image_lock:
+                _pending_image_bin[job_id] = pending_bin
+
+    # Build the final job state and save it.
     with _jobs_lock:
         jobs = _load_jobs_unlocked()
         for index, job in enumerate(jobs):
@@ -792,15 +888,13 @@ def set_agent_job_result(job_id: str, result: AgentResult, background_tasks: Bac
                 job.image_url = result.image_url
                 job.options = normalize_options(result.options)
                 job.metrics.update(result.metrics)
-                if result.status == "done" and result.image_prompt and not job.image_url:
-                    image_prompt_to_schedule = result.image_prompt
-                    job.metrics.update({
-                        "server_image_prompt": result.image_prompt[:180],
-                        "server_image_queued": True,
-                    })
-                if result.status == "done" and result.text and not job.audio_url:
-                    audio_url, tts_metrics = generate_tts_audio(result.text, job.id)
-                    job.audio_url = audio_url or None
+                if pending_bin is not None:
+                    job.metrics["server_image_format"] = "rgb565-le"
+                    job.metrics["server_image_pushed_ws"] = True
+                    job.metrics["server_image_bytes"] = len(pending_bin)
+                if has_image:
+                    job.metrics["server_image_prompt"] = result.image_prompt[:180]
+                if tts_metrics:
                     job.metrics.update(tts_metrics)
                 now = datetime.now(timezone.utc)
                 try:
@@ -812,8 +906,36 @@ def set_agent_job_result(job_id: str, result: AgentResult, background_tasks: Bac
                 job.updated_at = now.isoformat(timespec="seconds")
                 jobs[index] = job
                 _save_jobs_unlocked(jobs)
-                if image_prompt_to_schedule:
-                    schedule_response_image(image_prompt_to_schedule, job.id)
-                background_tasks.add_task(_notify_subscribers, job.id)
+                # _notify_subscribers reads _pending_image_bin and sends binary + final JSON.
+                background_tasks.add_task(_notify_subscribers, job_id)
                 return job
     raise HTTPException(status_code=404, detail="job not found")
+
+
+def _generate_image_for_job(job_id: str, image_prompt: str) -> bytes | None:
+    """Generate image synchronously in a thread.  Returns raw RGB565 bytes or None.
+
+    RLE-compressed images are decompressed before returning so the Stick can
+    push them directly to the display without needing RLE decoding logic.
+    """
+    try:
+        _, metrics = generate_response_image(image_prompt, job_id)
+        rgb565_path = IMAGE_DIR / f"{job_id}.rgb565"
+        if not rgb565_path.exists():
+            return None
+        data = rgb565_path.read_bytes()
+        # Decompress RLE if present; return as-is if already raw.
+        if data[:4] == b"RLE\x01":
+            data = rle_decompress(data[4:])
+        return bytes(data)
+    except Exception:
+        return None
+
+
+def _generate_tts_for_job(job_id: str, text: str) -> dict[str, Any]:
+    """Generate TTS synchronously in a thread.  Returns metrics dict."""
+    try:
+        _, metrics = generate_tts_audio(text, job_id)
+        return metrics
+    except Exception:
+        return {}
