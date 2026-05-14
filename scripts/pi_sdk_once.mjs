@@ -14,7 +14,7 @@
  * Output: assistant text on stdout. Diagnostics/errors go to stderr.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { performance } from "node:perf_hooks";
@@ -29,10 +29,14 @@ function resolvePiPackageRoot() {
   }
 
   const piBin = execFileSync("which", ["pi"], { encoding: "utf8" }).trim();
-  const launcher = readFileSync(piBin, "utf8");
+  const realPiBin = realpathSync(piBin);
+  if (realPiBin.includes("/node_modules/@earendil-works/pi-coding-agent/dist/cli.js")) {
+    return path.dirname(path.dirname(realPiBin));
+  }
+  const launcher = readFileSync(realPiBin, "utf8");
   const match = launcher.match(/node"?\s+"([^"]+\/node_modules\/@earendil-works\/pi-coding-agent\/dist\/cli\.js)"/);
-  if (!match) throw new Error(`Could not locate pi SDK package root from launcher: ${piBin}`);
-  const cliPath = match[1].replace(/^\$basedir\//, `${path.dirname(piBin)}/`);
+  if (!match) throw new Error(`Could not locate pi SDK package root from launcher: ${piBin} -> ${realPiBin}`);
+  const cliPath = match[1].replace(/^\$basedir\//, `${path.dirname(realPiBin)}/`);
   return path.dirname(path.dirname(cliPath));
 }
 
