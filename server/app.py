@@ -628,6 +628,19 @@ async def websocket_job_status(websocket: WebSocket, job_id: str) -> None:
                         sockets.remove(websocket)
                 await websocket.close()
                 return
+        else:
+            # Job not found — send a snapshot and close so the client can fall
+            # back to polling rather than waiting for a push that will never come.
+            await websocket.send_json({"id": job_id, "status": "not_found", "error": "job not found"})
+            async with _subscribers_lock:
+                sockets = _job_subscribers.get(job_id, [])
+                if websocket in sockets:
+                    sockets.remove(websocket)
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+            return
 
         # Wait for the job to complete.  _notify_subscribers sends the final
         # payload followed by {"_ws_close": true}; we break and close when we see it.
