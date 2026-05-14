@@ -4,6 +4,7 @@ from tempfile import NamedTemporaryFile
 from threading import Lock, Thread
 from typing import Any, Literal
 from uuid import uuid4
+import asyncio
 import hashlib
 import json
 import os
@@ -12,9 +13,10 @@ import sys
 import time
 import unicodedata
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 app = FastAPI(title="M5StickS3 Voice Terminal MVP")
 
@@ -36,6 +38,8 @@ TTS_SAMPLE_RATE = int(os.environ.get("TTS_SAMPLE_RATE", "44100"))
 _whisper_model: Any | None = None
 _tts_engine: Any | None = None
 _jobs_lock = Lock()
+_job_subscribers: dict[str, list[WebSocket]] = {}
+_subscribers_lock = asyncio.Lock()
 
 
 class CommandRequest(BaseModel):
@@ -563,18 +567,89 @@ def claim_next_agent_job(worker: str = "pi") -> AgentJob | None:
     return None
 
 
+def _get_job_unlocked(jobs: list[AgentJob], job_id: str) -> AgentJob | None:
+    """Look up a job by id within an already-loaded list; returns None if not found."""
+    for job in jobs:
+        if job.id == job_id:
+            return job
+    return None
+
+
+async def _notify_subscribers(job_id: str) -> None:
+    """Push the final job result to every WebSocket subscriber for *job_id* and disconnect."""
+    async with _subscribers_lock:
+        sockets = _job_subscribers.pop(job_id, [])
+    if not sockets:
+        return
+    with _jobs_lock:
+        jobs = _load_jobs_unlocked()
+    job = _get_job_unlocked(jobs, job_id)
+    if job is None:
+        return
+    payload = job.model_dump()
+    for ws in sockets:
+        try:
+            await ws.send_json(payload)
+            await ws.close()
+        except Exception:
+            pass
+
+
+@app.websocket("/ws/jobs/{job_id}")
+async def websocket_job_status(websocket: WebSocket, job_id: str) -> None:
+    """Push real-time job status to the Stick via WebSocket.
+
+    The client connects immediately after receiving a job_id from /voice-command
+    and receives push messages rather than polling."""
+    await websocket.accept()
+
+    # Register as subscriber so set_agent_job_result can notify us.
+    async with _subscribers_lock:
+        _job_subscribers.setdefault(job_id, []).append(websocket)
+
+    try:
+        # Send a snapshot of the current state right away.
+        with _jobs_lock:
+            jobs = _load_jobs_unlocked()
+        job = _get_job_unlocked(jobs, job_id)
+        if job:
+            await websocket.send_json(job.model_dump())
+            if job.status in ("done", "failed"):
+                async with _subscribers_lock:
+                    sockets = _job_subscribers.get(job_id, [])
+                    if websocket in sockets:
+                        sockets.remove(websocket)
+                await websocket.close()
+                return
+
+        # Wait for the job to complete.  The _notify_subscribers background
+        # task will send the final payload and close the connection.  In the
+        # meantime we just listen for keep-alive pings or a client disconnect.
+        while True:
+            data = await websocket.receive_text()
+            if data == "ping":
+                await websocket.send_text("pong")
+    except WebSocketDisconnect:
+        pass
+    finally:
+        async with _subscribers_lock:
+            sockets = _job_subscribers.get(job_id, [])
+            if websocket in sockets:
+                sockets.remove(websocket)
+
+
 @app.get("/agent/jobs/{job_id}", response_model=AgentJob)
 def get_agent_job(job_id: str) -> AgentJob:
     with _jobs_lock:
         jobs = _load_jobs_unlocked()
-    for job in jobs:
-        if job.id == job_id:
-            return job
-    raise HTTPException(status_code=404, detail="job not found")
+    job = _get_job_unlocked(jobs, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job
 
 
 @app.post("/agent/jobs/{job_id}/result", response_model=AgentJob)
-def set_agent_job_result(job_id: str, result: AgentResult) -> AgentJob:
+def set_agent_job_result(job_id: str, result: AgentResult, background_tasks: BackgroundTasks) -> AgentJob:
     """Store Pi/agent output so the device or UI can retrieve it."""
     result_post_start = time.perf_counter()
     image_prompt_to_schedule: str | None = None
@@ -612,5 +687,6 @@ def set_agent_job_result(job_id: str, result: AgentResult) -> AgentJob:
                 _save_jobs_unlocked(jobs)
                 if image_prompt_to_schedule:
                     schedule_response_image(image_prompt_to_schedule, job.id)
+                background_tasks.add_task(_notify_subscribers, job.id)
                 return job
     raise HTTPException(status_code=404, detail="job not found")

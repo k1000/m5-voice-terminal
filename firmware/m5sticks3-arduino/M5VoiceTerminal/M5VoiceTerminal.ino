@@ -1,6 +1,7 @@
 #include <M5Unified.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include "config.h"
 #include "wolf_faces.h"
@@ -18,6 +19,16 @@ static size_t recorded_samples = 0;
 static const String SERVER_BASE_URL = String(VOICE_URL).substring(0, String(VOICE_URL).lastIndexOf('/'));
 static constexpr uint32_t POLL_INTERVAL_MS = 1500;
 static constexpr uint32_t POLL_TIMEOUT_MS = 120000;
+
+// WebSocket job streaming (replaces polling).
+static WebSocketsClient wsClient;
+static StaticJsonDocument<3072> wsJobDoc;
+static volatile bool wsJobDone = false;
+static volatile bool wsJobSuccess = false;
+static volatile bool wsJobConnected = false;
+static uint32_t wsLastActivityMs = 0;
+static constexpr uint32_t WS_TIMEOUT_MS = 120000;
+static constexpr uint32_t WS_PING_INTERVAL_MS = 10000;
 static constexpr uint32_t SCREEN_SLEEP_MS = 20000;
 static constexpr uint8_t SCREEN_BRIGHTNESS = 255;
 static constexpr uint8_t SPEAKER_VOLUME = 230;  // Keep <= ~230 on battery to avoid brownouts.
@@ -191,6 +202,59 @@ static void writeWavHeader(uint8_t *header, uint32_t sampleRate, uint32_t sample
   memcpy(header + 40, &dataSize, 4);
 }
 
+static bool parseHostPort(const String &url, String &host, uint16_t &port) {
+  int start = url.indexOf("://");
+  if (start < 0) return false;
+  start += 3;
+  int colon = url.indexOf(':', start);
+  int slash = url.indexOf('/', start);
+  if (colon > start) {
+    host = url.substring(start, colon);
+    String portStr = url.substring(colon + 1, (slash > 0 ? slash : url.length()));
+    port = portStr.toInt();
+  } else {
+    host = url.substring(start, (slash > 0 ? slash : url.length()));
+    port = 80;
+  }
+  return host.length() > 0;
+}
+
+static void wsEventHandler(WStype_t type, uint8_t *payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
+      wsJobConnected = true;
+      wsLastActivityMs = millis();
+      break;
+    case WStype_DISCONNECTED:
+      wsJobConnected = false;
+      if (!wsJobDone) {
+        wsJobDone = true;
+        wsJobSuccess = false;
+      }
+      break;
+    case WStype_TEXT: {
+      wsLastActivityMs = millis();
+      wsJobDoc.clear();
+      DeserializationError err = deserializeJson(wsJobDoc, payload, length);
+      if (err) break;
+      const char *status = wsJobDoc["status"] | "";
+      if (strcmp(status, "done") == 0 || strcmp(status, "failed") == 0) {
+        wsJobDone = true;
+        wsJobSuccess = (strcmp(status, "done") == 0);
+      }
+      break;
+    }
+    case WStype_PONG:
+      wsLastActivityMs = millis();
+      break;
+    case WStype_ERROR:
+      wsJobConnected = false;
+      break;
+    default:
+      break;
+  }
+}
+
 static bool connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -258,6 +322,7 @@ static String extractJobId(const String &response) {
 }
 
 static bool pollJobResult(const String &jobId);
+static bool streamJobResult(const String &jobId);
 static String postTextCommand(const String &text);
 
 static void drawOptions(JsonArray options, int selected) {
@@ -364,6 +429,99 @@ static bool playAudioUrl(const String &audioUrl) {
   M5.Speaker.end();
   free(wav);
   return ok;
+}
+
+static bool streamJobResult(const String &jobId) {
+  String host;
+  uint16_t port = 8010;
+  if (!parseHostPort(SERVER_BASE_URL, host, port)) {
+    drawStatus("WS parse", SERVER_BASE_URL);
+    return false;
+  }
+
+  String path = "/ws/jobs/" + jobId;
+  wsJobDone = false;
+  wsJobSuccess = false;
+  wsJobConnected = false;
+  wsLastActivityMs = millis();
+  wsJobDoc.clear();
+
+  wsClient.disconnect();
+  wsClient.onEvent(wsEventHandler);
+  wsClient.begin(host, port, path);
+  wsClient.setReconnectInterval(0);  // No auto-reconnect; we handle it.
+
+  const char spin[] = {'|', '/', '-', '\\'};
+  uint32_t i = 0;
+  uint32_t lastPingMs = millis();
+
+  while (!wsJobDone && millis() - wsLastActivityMs < WS_TIMEOUT_MS) {
+    wsClient.loop();
+    M5.update();
+
+    if (wsJobConnected) {
+      // Keep the TCP connection alive.
+      if (millis() - lastPingMs >= WS_PING_INTERVAL_MS) {
+        wsClient.sendTXT("ping");
+        lastPingMs = millis();
+      }
+
+      // Animate waiting face while job is in progress.
+      uint32_t elapsed = millis() - wsLastActivityMs + 1;
+      wakeScreen();
+      M5.Display.clear(BLACK);
+      drawFaceImage((elapsed / 3000) % 2 == 0 ? "waiting-left" : "waiting-right");
+      M5.Display.setTextSize(2);
+      M5.Display.setTextColor(YELLOW, BLACK);
+      drawWrapped(String("Listening ") + spin[i++ % 4], 4, 142, 10, 18);
+      M5.Display.setTextSize(1);
+      M5.Display.setTextColor(WHITE, BLACK);
+      drawWrapped("Job " + jobId, 4, 200, 18, 12);
+    }
+    delay(20);
+  }
+
+  wsClient.disconnect();
+
+  if (!wsJobDone) {
+    drawStatus("WS timeout", "Job " + jobId);
+    return false;
+  }
+
+  if (!wsJobSuccess) {
+    String error = wsJobDoc["error"] | "agent failed";
+    drawSentimentResponse("sad", error);
+    return false;
+  }
+
+  // ---- Job succeeded, same behaviour as pollJobResult ----
+  String result = wsJobDoc["result_text"] | "[done: no text]";
+  String sentiment = wsJobDoc["sentiment"] | "neutral";
+  String audioUrl = wsJobDoc["audio_url"] | "";
+  String imageUrl = wsJobDoc["image_url"] | "";
+
+  drawJobResponse(sentiment, result, imageUrl);
+  if (audioUrl.length()) {
+    delay(700);
+    playAudioUrl(audioUrl);
+    drawJobResponse(sentiment, result, imageUrl);
+  }
+
+  JsonArray options = wsJobDoc["options"].as<JsonArray>();
+  String selected = chooseOption(options);
+  if (selected.length()) {
+    if (selected == "New request") {
+      drawReady();
+      return true;
+    }
+    drawStatus("Selected", selected);
+    String response = postTextCommand(selected);
+    String nextJob = extractJobId(response);
+    if (nextJob.length()) {
+      return streamJobResult(nextJob);
+    }
+  }
+  return true;
 }
 
 static bool pollJobResult(const String &jobId) {
@@ -544,7 +702,10 @@ void loop() {
       String jobId = extractJobId(response);
       if (jobId.length()) {
         drawStatus("Queued", "Job " + jobId);
-        pollJobResult(jobId);
+        if (!streamJobResult(jobId)) {
+          // Fall back to polling if WebSocket stream fails.
+          pollJobResult(jobId);
+        }
         // Leave the final result/error on screen until the next button press.
       } else {
         drawStatus("Server", response.substring(0, 120));
