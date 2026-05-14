@@ -319,6 +319,8 @@ def main() -> None:
                         agent_s = time.perf_counter() - start
                         mode = "pi"
                 metrics = {"agent_worker_s": round(agent_s, 3), "agent_worker_mode": mode}
+                if mode in {"pi-sdk", "pi-sdk-full"}:
+                    metrics["agent_js_runtime"] = js_runtime()
                 if queue_wait_s is not None:
                     metrics["agent_queue_wait_s"] = round(queue_wait_s, 3)
                 complete(base_url, job_id, text, metrics=metrics, sentiment=sentiment, options=options, image_prompt=image_prompt)
