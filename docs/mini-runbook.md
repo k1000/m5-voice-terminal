@@ -21,9 +21,9 @@ pip install -r requirements-mini.txt
 Pi worker requirements:
 
 ```sh
-node --version
-pi --version
-make test
+PATH=/opt/homebrew/bin:$PATH node --version
+PATH=/opt/homebrew/bin:$PATH pi --version
+PATH=/opt/homebrew/bin:$PATH make test
 ```
 
 If `node` or `pi` is missing, install/configure Pi on mini before using `VOICE_WORKER_BACKEND=pi-sdk-full`. The server can still run without the worker for `/health`, `/models`, and upload/STT testing.
