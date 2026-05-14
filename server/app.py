@@ -274,9 +274,7 @@ def rle_decompress(data: bytes) -> bytes:
                 result.append(data[i + 1])
                 i += 2
         else:
-            # Repeat run: pixel bytes follow.
-            result.append(data[i])
-            result.append(data[i + 1])
+            # Repeat run: pixel bytes follow.  Output exactly count pixels total.
             pixel = int.from_bytes([data[i], data[i + 1]], "little")
             for _ in range(count):
                 result.extend(pixel.to_bytes(2, "little"))
@@ -928,8 +926,10 @@ def _generate_image_for_job(job_id: str, image_prompt: str) -> bytes | None:
     RLE-compressed images are decompressed before returning so the Stick can
     push them directly to the display without needing RLE decoding logic.
     """
+    # Always prefix with pixel-art style so AI images match the retro aesthetic.
+    styled_prompt = f"pixel art {image_prompt}, old arcade style, 1990s computer graphics"
     try:
-        _, metrics = generate_response_image(image_prompt, job_id)
+        _, metrics = generate_response_image(styled_prompt, job_id)
         rgb565_path = IMAGE_DIR / f"{job_id}.rgb565"
         if not rgb565_path.exists():
             return None
