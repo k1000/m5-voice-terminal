@@ -238,17 +238,49 @@ def rle_compress(data: bytes) -> tuple[bytes, bool]:
     return bytes([0x52, 0x4C, 0x45, 0x01]) + compressed, True
 
 
+def _image_helpers() -> list[tuple[Path, str, list[str]]]:
+    """Return (helper_path, backend_name, extra_args) ordered by priority.
+
+    Tries in order:
+      1. MLX SDXL Turbo via scripts/mlx_image.py  (default, offline, fast)
+      2. MiniMax API via MINIMAX_IMAGE_HELPER         (online, better quality)
+
+    Set MLX_IMAGE_HELPER="" to disable MLX.  Set MLX_IMAGE_MODEL to override the
+    default sdxl-turbo model.  Set MINIMAX_IMAGE_HELPER to override MiniMax path.
+    """
+    helpers: list[tuple[Path, str, list[str]]] = []
+
+    # MLX helper — default unless explicitly disabled.
+    mlx_disabled = os.environ.get("MLX_IMAGE_HELPER", "") == ""
+    if not mlx_disabled:
+        mlx_helper = os.environ.get("MLX_IMAGE_HELPER", "")
+        path = Path(mlx_helper) if mlx_helper else Path(__file__).parents[1] / "scripts" / "mlx_image.py"
+        if path.exists():
+            model = os.environ.get("MLX_IMAGE_MODEL", "stabilityai/sdxl-turbo")
+            steps = os.environ.get("MLX_IMAGE_STEPS", "4")
+            helpers.append((path, "mlx", ["--model", model, "--steps", steps]))
+
+    # MiniMax API helper — used as fallback.
+    minimax_path = Path(os.environ.get(
+        "MINIMAX_IMAGE_HELPER",
+        str(Path.home() / ".pi/agent/skills/minimax-image/scripts/minimax_image.py"),
+    ))
+    if minimax_path.exists():
+        helpers.append((minimax_path, "minimax", []))
+
+    return helpers
+
+
 def generate_response_image(prompt: str, job_id: str) -> tuple[str | None, dict[str, Any]]:
     """Generate or reuse a 135x135 RGB565 image and return its download URL if successful."""
     _ensure_data_dir()
     started = time.perf_counter()
     cache_key = image_cache_key(prompt)
     metrics: dict[str, Any] = {"server_image_prompt": prompt[:180], "server_image_cache_key": cache_key}
-    helper = Path(os.environ.get("MINIMAX_IMAGE_HELPER", "/Users/kamil/.pi/agent/skills/minimax-image/scripts/minimax_image.py"))
-    jpg_path = IMAGE_DIR / f"{job_id}.jpg"
+    img_path = IMAGE_DIR / f"{job_id}.png"
     rgb565_path = IMAGE_DIR / f"{job_id}.rgb565"
     cache_rgb565_path = IMAGE_CACHE_DIR / f"{cache_key}.rgb565"
-    cache_jpg_path = IMAGE_CACHE_DIR / f"{cache_key}.jpg"
+    cache_jpg_path = IMAGE_CACHE_DIR / f"{cache_key}.png"
     try:
         if cache_rgb565_path.exists():
             cached_data = cache_rgb565_path.read_bytes()
@@ -262,21 +294,43 @@ def generate_response_image(prompt: str, job_id: str) -> tuple[str | None, dict[
             })
             return f"/image/{job_id}", metrics
 
-        if not helper.exists():
-            raise RuntimeError(f"MiniMax image helper not found: {helper}")
-        import subprocess
-        subprocess.run(
-            [sys.executable, str(helper), prompt, "--square", "135", "--output", str(jpg_path)],
-            text=True,
-            capture_output=True,
-            check=True,
-            timeout=120,
-        )
+        # Try helpers in priority order; raise if none are available.
+        helpers = _image_helpers()
+        if not helpers:
+            raise RuntimeError(
+                "No image helper found. Set MLX_IMAGE_HELPER or MINIMAX_IMAGE_HELPER. "
+                "See scripts/mlx_image.py for the MLX SDXL Turbo helper."
+            )
+
+        last_error: Exception | None = None
+        for helper_path, backend, extra_args in helpers:
+            try:
+                import subprocess
+                cmd = [sys.executable, str(helper_path), prompt, "--square", "135",
+                       "--output", str(img_path), *extra_args]
+                subprocess.run(cmd, text=True, capture_output=True, check=True, timeout=120)
+                metrics.setdefault("server_image_backend", backend)
+                break  # success
+            except Exception as exc:
+                last_error = exc
+                metrics.setdefault("server_image_backend", backend + "_error")
+        else:
+            raise RuntimeError(f"All image helpers failed. Last error: {last_error}") from last_error
         from PIL import Image
 
-        with Image.open(jpg_path) as image:
-            image = image.convert("RGB").resize((135, 135), Image.Resampling.LANCZOS)
-            image.save(cache_jpg_path, quality=95)
+        # Find the image file: MLX saves PNG (lossless), MiniMax saves JPG.
+        from PIL import Image as _PILImage
+        img_file = None
+        for _f in (img_path, img_path.with_suffix(".jpg")):
+            if _f.exists():
+                img_file = _f
+                break
+        if img_file is None:
+            raise RuntimeError(f"Image helper ran but produced no file. Expected {img_path} or {img_path.with_suffix('.jpg')}")
+
+        with _PILImage.open(img_file) as image:
+            image = image.convert("RGB").resize((135, 135), _PILImage.Resampling.LANCZOS)
+            image.save(cache_jpg_path, format="PNG")
             raw = bytearray()
             for r, g, b in image.getdata():
                 value = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
