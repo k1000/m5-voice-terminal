@@ -576,7 +576,13 @@ def _get_job_unlocked(jobs: list[AgentJob], job_id: str) -> AgentJob | None:
 
 
 async def _notify_subscribers(job_id: str) -> None:
-    """Push the final job result to every WebSocket subscriber for *job_id* and disconnect."""
+    """Push the final job result to every WebSocket subscriber for *job_id*.
+
+    Sends the payload followed by a _ws_close marker so the handler exits its
+    receive loop and closes the connection.  We do *not* call ws.close() here
+    because the handler's finally-block also closes — we make both sides
+    idempotent with try/except.
+    """
     async with _subscribers_lock:
         sockets = _job_subscribers.pop(job_id, [])
     if not sockets:
@@ -590,8 +596,9 @@ async def _notify_subscribers(job_id: str) -> None:
     for ws in sockets:
         try:
             await ws.send_json(payload)
-            await ws.close()
+            await ws.send_json({"_ws_close": True})
         except Exception:
+            # Socket already closed or errored — handler's finally will clean up.
             pass
 
 
@@ -622,13 +629,14 @@ async def websocket_job_status(websocket: WebSocket, job_id: str) -> None:
                 await websocket.close()
                 return
 
-        # Wait for the job to complete.  The _notify_subscribers background
-        # task will send the final payload and close the connection.  In the
-        # meantime we just listen for keep-alive pings or a client disconnect.
+        # Wait for the job to complete.  _notify_subscribers sends the final
+        # payload followed by {"_ws_close": true}; we break and close when we see it.
         while True:
             data = await websocket.receive_text()
             if data == "ping":
                 await websocket.send_text("pong")
+            elif '"_ws_close"' in data:
+                break
     except WebSocketDisconnect:
         pass
     finally:
@@ -636,6 +644,10 @@ async def websocket_job_status(websocket: WebSocket, job_id: str) -> None:
             sockets = _job_subscribers.get(job_id, [])
             if websocket in sockets:
                 sockets.remove(websocket)
+        try:
+            await websocket.close()
+        except Exception:
+            pass  # idempotent: already closed by early-return or _notify_subscribers caller.
 
 
 @app.get("/agent/jobs/{job_id}", response_model=AgentJob)
