@@ -14,8 +14,10 @@ M5StickS3 BtnA
   -> scripts/agent_worker.py handles prompt, with recent same-device history
   -> POST /agent/jobs/{id}/result
   -> server optionally generates RGB565 image, then Supertonic WAV
-  -> Stick polls job, displays generated image or bundled face/result, downloads audio, plays WAV
+  -> Stick connects WebSocket ws://server:8010/ws/jobs/{id}, receives push when done
+  -> Stick displays generated image or bundled face/result, downloads audio, plays WAV
   -> optional BtnB/BtnA menu sends follow-up /command choices
+  -> if WebSocket fails, Stick falls back to GET /agent/jobs/{id} polling
 ```
 
 The legacy MicroPython client in `stick/` is retained as a fallback text-command reference. The active device firmware is the Arduino/M5Unified sketch in `firmware/m5sticks3-arduino/M5VoiceTerminal/`.

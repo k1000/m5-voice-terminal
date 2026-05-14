@@ -1,6 +1,6 @@
 # M5StickS3 Voice Terminal — Status Quo
 
-Date: 2026-05-13
+Date: 2026-05-14
 
 ## Architecture
 
@@ -24,8 +24,10 @@ Date: 2026-05-13
         │
         ▼
 [M5StickS3]
-  polls GET /agent/jobs/{id} every 1.5s
+  opens ws://server:8010/ws/jobs/{id}
+  → server pushes status updates in real time
   → status=done → display bundled sentiment face/result_text on LCD and play audio_url WAV when present
+  → falls back to GET /agent/jobs/{id} polling every 1.5s if WebSocket fails
 ```
 
 ## Current Runtime State
@@ -45,6 +47,7 @@ POST /voice-command                → audio upload, STT, returns job_id
 GET  /agent/jobs                   → all jobs (optional ?status=queued)
 GET  /agent/jobs/next?worker=pi   → claim oldest queued job
 GET  /agent/jobs/{id}             → job detail including result_text, sentiment, audio_url
+WS   /ws/jobs/{id}                → WebSocket push: connects, receives snapshot then final result push
 POST /agent/jobs/{id}/result      → post result from agent; server generates Supertonic WAV
 GET  /audio/{job_id}              → download generated WAV response audio; audio id equals job id
 GET  /image/{job_id}              → download optional custom RGB565 image; standard faces are bundled in firmware
@@ -131,6 +134,7 @@ Current bottleneck: agent response generation (~6–25s). STT is fast (<2s warm)
 - First mlx-whisper run is slow due to model download; subsequent runs are fast.
 - Audio playback speed issue was traced to writing Supertonic output as 24 kHz. Server now writes PCM_16 WAV at Supertonic's native sample rate, currently 44.1 kHz.
 - The server deletes old generated WAV files whenever a new TTS artifact is generated; the Stick downloads audio into PSRAM and frees it after playback.
+- Arduino firmware now depends on `WebSockets` library by Markus Sattler (install via Arduino Library Manager or `arduino-cli lib install "WebSockets"`).
 
 ## Next Steps
 
@@ -139,6 +143,7 @@ Current bottleneck: agent response generation (~6–25s). STT is fast (<2s warm)
 3. **Hold-to-talk UX** — tune maximum duration, minimum duration, and progress indication after real-device testing.
 4. **Reduce agent latency** — compare MiniMax-M2.7-highspeed vs other model aliases; test with tools disabled for comparison.
 5. **Runtime runbook** — replace volatile PID/status rows with a repeatable process supervisor or check script.
+6. **WebSocket hardening** — add automatic reconnection on WiFi drop; measure latency vs polling in real conditions.
 
 ## Project Structure
 
