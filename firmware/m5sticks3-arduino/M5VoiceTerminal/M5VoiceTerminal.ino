@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include "config.h"
 #include "wolf_faces.h"
+#include "generated_faces.h"
 
 // Arduino/M5Unified microphone uploader sketch for StickS3.
 // Requires board: M5StickS3, libraries: M5Unified, M5GFX.
@@ -34,7 +35,7 @@ static constexpr uint32_t WS_TIMEOUT_MS = 120000;
 static constexpr uint32_t WS_PING_INTERVAL_MS = 10000;
 static constexpr uint32_t SCREEN_SLEEP_MS = 20000;
 static constexpr uint8_t SCREEN_BRIGHTNESS = 255;
-static constexpr uint8_t SPEAKER_VOLUME = 230;  // Keep <= ~230 on battery to avoid brownouts.
+static constexpr uint8_t SPEAKER_VOLUME = 200;  // Conservative volume to avoid battery/amp brownout cutoffs.
 static uint32_t last_screen_activity_ms = 0;
 static bool screen_awake = true;
 
@@ -113,10 +114,10 @@ static void stickTelemetry() {
 #define STICK_LOG_ERROR(tag, msg)   stickLog("error", tag, String(msg))
 
 static void wakeScreen() {
-  if (!screen_awake) {
-    M5.Display.setBrightness(SCREEN_BRIGHTNESS);
-    screen_awake = true;
-  }
+  // Always restore brightness. Some subsystems/power transitions can leave the
+  // panel dim/off while our local screen_awake flag is still true.
+  M5.Display.setBrightness(SCREEN_BRIGHTNESS);
+  screen_awake = true;
   last_screen_activity_ms = millis();
 }
 
@@ -156,13 +157,14 @@ static void drawStatus(const char *title, const String &line = "") {
 }
 
 static const uint16_t *faceDataFor(const String &state) {
-  if (state == "recording") return WOLF_FACE_RECORDING;
-  if (state == "waiting-left") return WOLF_FACE_WAITING_LEFT;
-  if (state == "waiting-right") return WOLF_FACE_WAITING_RIGHT;
-  if (state == "waiting") return WOLF_FACE_WAITING_RIGHT;
-  if (state == "happy") return WOLF_FACE_HAPPY;
-  if (state == "sad") return WOLF_FACE_SAD;
-  return WOLF_FACE_NEUTRAL;
+  // Custom generated face mapping.
+  if (state == "recording") return FACE_SKEPTICAL;
+  if (state == "waiting-left") return FACE_SHUSHING;
+  if (state == "waiting-right") return FACE_SHUSHING;
+  if (state == "waiting") return FACE_SHUSHING;
+  if (state == "happy") return FACE_HAPPY;
+  if (state == "sad") return FACE_WORRIED;
+  return FACE_THINKING;
 }
 
 static void drawFaceImage(const String &state) {
@@ -522,6 +524,25 @@ static void drawOptions(JsonArray options, int selected) {
   M5.Display.setTextSize(1);
 }
 
+static uint32_t readLe32(const uint8_t *p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint32_t wavDurationMs(const uint8_t *wav, int len) {
+  if (!wav || len < 44 || memcmp(wav, "RIFF", 4) != 0 || memcmp(wav + 8, "WAVE", 4) != 0) return 0;
+  uint32_t byteRate = readLe32(wav + 28);
+  if (byteRate == 0) return 0;
+  int pos = 12;
+  while (pos + 8 <= len) {
+    uint32_t chunkSize = readLe32(wav + pos + 4);
+    if (memcmp(wav + pos, "data", 4) == 0) {
+      return (uint32_t)(((uint64_t)chunkSize * 1000ULL) / byteRate);
+    }
+    pos += 8 + chunkSize + (chunkSize & 1);
+  }
+  return 0;
+}
+
 static String chooseOption(JsonArray options) {
   if (options.size() == 0) return "";
   int selected = 0;
@@ -541,10 +562,19 @@ static String chooseOption(JsonArray options) {
   return "";
 }
 
+static void drawAudioOverlay(const String &line) {
+  wakeScreen();
+  M5.Display.fillRect(0, 222, M5.Display.width(), 18, BLACK);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(CYAN, BLACK);
+  M5.Display.setCursor(4, 226);
+  M5.Display.print(line.substring(0, 16));
+}
+
 static bool playAudioUrl(const String &audioUrl) {
   if (!audioUrl.length()) return false;
   String url = audioUrl.startsWith("http") ? audioUrl : SERVER_BASE_URL + audioUrl;
-  drawStatus("Audio", "downloading...");
+  drawAudioOverlay("Audio download");
 
   HTTPClient http;
   http.begin(url);
@@ -590,13 +620,25 @@ static bool playAudioUrl(const String &audioUrl) {
     return false;
   }
 
-  drawStatus("Audio", "playing...");
+  uint32_t durationMs = wavDurationMs(wav, len);
+  drawAudioOverlay("Audio playing");
   M5.Mic.end();
   M5.Speaker.begin();
   M5.Speaker.setVolume(SPEAKER_VOLUME);
   bool ok = M5.Speaker.playWav(wav, len, 1, -1, true);
   if (ok) {
-    while (M5.Speaker.isPlaying()) {
+    // M5Unified playback is asynchronous and isPlaying() may briefly report
+    // false before the decoder/DMA fully drains. Keep the WAV buffer alive for
+    // the expected WAV duration so playback is not truncated by free()/end().
+    uint32_t started = millis();
+    uint32_t holdMs = durationMs ? durationMs + 500 : 3000;
+    while (millis() - started < holdMs) {
+      M5.update();
+      delay(10);
+    }
+    // Small drain window if the speaker still reports active after duration.
+    uint32_t drainStarted = millis();
+    while (M5.Speaker.isPlaying() && millis() - drainStarted < 1000) {
       M5.update();
       delay(10);
     }
@@ -636,6 +678,7 @@ static bool streamJobResult(const String &jobId) {
   uint32_t lastPingMs = millis();
   uint32_t lastWaitDrawMs = 0;
   int lastWaitFaceFrame = -1;
+  bool waitingScreenDrawn = false;
 
   while (!wsJobDone && millis() - wsLastActivityMs < WS_TIMEOUT_MS) {
     wsClient.loop();
@@ -648,24 +691,32 @@ static bool streamJobResult(const String &jobId) {
         lastPingMs = millis();
       }
 
-      // Animate waiting face only if binary image hasn't arrived yet.
-      // Throttle redraws: clearing/redrawing every 20ms causes visible blink.
-      // Redraw only when spinner/face frame changes (~4 FPS).
+      // Waiting screen: do NOT full-clear repeatedly. Full clear + pushImage
+      // causes visible blinking on ST7789. Draw once, then update only small
+      // text rectangles and replace the face image in-place.
       if (!wsBinaryDisplayed) {
         uint32_t nowMs = millis();
         int faceFrame = (nowMs / 3000) % 2;
-        if (nowMs - lastWaitDrawMs >= 250 || faceFrame != lastWaitFaceFrame) {
-          lastWaitDrawMs = nowMs;
-          lastWaitFaceFrame = faceFrame;
+        if (!waitingScreenDrawn) {
+          waitingScreenDrawn = true;
           wakeScreen();
           M5.Display.clear(BLACK);
           drawFaceImage(faceFrame == 0 ? "waiting-left" : "waiting-right");
-          M5.Display.setTextSize(2);
-          M5.Display.setTextColor(YELLOW, BLACK);
-          drawWrapped(String("Listening ") + spin[i++ % 4], 4, 142, 10, 18);
           M5.Display.setTextSize(1);
           M5.Display.setTextColor(WHITE, BLACK);
           drawWrapped("Job " + jobId, 4, 200, 18, 12);
+          lastWaitFaceFrame = faceFrame;
+        }
+        if (faceFrame != lastWaitFaceFrame) {
+          lastWaitFaceFrame = faceFrame;
+          drawFaceImage(faceFrame == 0 ? "waiting-left" : "waiting-right");
+        }
+        if (nowMs - lastWaitDrawMs >= 250) {
+          lastWaitDrawMs = nowMs;
+          M5.Display.fillRect(0, 142, M5.Display.width(), 42, BLACK);
+          M5.Display.setTextSize(2);
+          M5.Display.setTextColor(YELLOW, BLACK);
+          drawWrapped(String("Thinking ") + spin[i++ % 4], 4, 142, 10, 18);
         }
       }
     }

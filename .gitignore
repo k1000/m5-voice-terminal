@@ -14,5 +14,7 @@ firmware/**/config.h
 
 # Runtime state and generated media
 /data/*.json
+/data/*.log
 /data/audio/
 /data/images/
+/data/image_cache/

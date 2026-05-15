@@ -35,6 +35,8 @@ IMAGE_CACHE_DIR = IMAGE_DIR / "cache"
 TTS_VOICE = os.environ.get("TTS_VOICE", "M1")
 TTS_LANG = os.environ.get("TTS_LANG", "en")
 TTS_SAMPLE_RATE = int(os.environ.get("TTS_SAMPLE_RATE", "44100"))
+# Stick playback target: lower-rate PCM16 mono reduces payload and is easier for M5Unified Speaker.
+TTS_OUTPUT_SAMPLE_RATE = int(os.environ.get("TTS_OUTPUT_SAMPLE_RATE", "16000"))
 
 _whisper_model: Any | None = None
 _tts_engine: Any | None = None
@@ -467,17 +469,31 @@ def generate_tts_audio(text: str, job_id: str) -> tuple[str, dict[str, Any]]:
         wav, duration = engine.synthesize(ascii_text, voice_style=style)
         tts_text = ascii_text
     path = AUDIO_DIR / f"{job_id}.wav"
-    sample_rate = int(getattr(engine, "sample_rate", TTS_SAMPLE_RATE) or TTS_SAMPLE_RATE)
+    source_sample_rate = int(getattr(engine, "sample_rate", TTS_SAMPLE_RATE) or TTS_SAMPLE_RATE)
+    output_sample_rate = TTS_OUTPUT_SAMPLE_RATE
+
+    audio = wav.squeeze().astype("float32")
+    did_resample = output_sample_rate != source_sample_rate
+    if did_resample and len(audio) > 1:
+        import numpy as np
+
+        source_len = len(audio)
+        target_len = max(1, int(round(source_len * output_sample_rate / source_sample_rate)))
+        x_old = np.linspace(0.0, 1.0, num=source_len, endpoint=False)
+        x_new = np.linspace(0.0, 1.0, num=target_len, endpoint=False)
+        audio = np.interp(x_new, x_old, audio).astype("float32")
+
     # Write PCM_16 because M5Unified Speaker.playWav supports PCM WAV up to 16-bit.
-    # Supertonic currently outputs 44.1 kHz; using 24 kHz made Stick playback too slow.
-    sf.write(path, wav.squeeze().astype("float32"), sample_rate, subtype="PCM_16")
+    sf.write(path, audio, output_sample_rate, subtype="PCM_16")
     # Public URL uses the exact job id; the server maps it to <job_id>.wav internally.
     return f"/audio/{job_id}", {
         "server_tts_s": round(time.perf_counter() - started, 3),
         "tts_engine": "supertonic",
         "tts_voice": TTS_VOICE,
         "tts_lang": TTS_LANG,
-        "tts_sample_rate": sample_rate,
+        "tts_source_sample_rate": source_sample_rate,
+        "tts_sample_rate": output_sample_rate,
+        "tts_resampled": did_resample,
         "tts_removed_old_files": removed,
         "tts_duration_s": round(float(duration[0]) if hasattr(duration, "__len__") else float(duration), 3),
         "tts_text_sanitized": tts_text != text.strip(),
@@ -1044,9 +1060,10 @@ def set_agent_job_result(job_id: str, result: AgentResult, background_tasks: Bac
         tts_future = _thread_pool().submit(_generate_tts_for_job, job_id, result.text)
 
     # Collect results.  Both futures run in parallel; wait for each independently.
+    tts_audio_url: str | None = None
     tts_metrics: dict[str, Any] = {}
     if tts_future is not None:
-        tts_metrics = tts_future.result()
+        tts_audio_url, tts_metrics = tts_future.result()
 
     # Save pending binary image so _notify_subscribers can push it as a binary frame.
     pending_bin: bytes | None = None
@@ -1065,7 +1082,7 @@ def set_agent_job_result(job_id: str, result: AgentResult, background_tasks: Bac
                 job.result_text = result.text
                 job.error = result.error
                 job.sentiment = result.sentiment or infer_sentiment(result.text or result.error, result.status)
-                job.audio_url = result.audio_url
+                job.audio_url = result.audio_url or tts_audio_url
                 job.image_url = result.image_url
                 job.options = normalize_options(result.options)
                 job.metrics.update(result.metrics)
@@ -1114,10 +1131,10 @@ def _generate_image_for_job(job_id: str, image_prompt: str) -> bytes | None:
         return None
 
 
-def _generate_tts_for_job(job_id: str, text: str) -> dict[str, Any]:
-    """Generate TTS synchronously in a thread.  Returns metrics dict."""
+def _generate_tts_for_job(job_id: str, text: str) -> tuple[str | None, dict[str, Any]]:
+    """Generate TTS synchronously in a thread. Returns (audio_url, metrics)."""
     try:
-        _, metrics = generate_tts_audio(text, job_id)
-        return metrics
-    except Exception:
-        return {}
+        audio_url, metrics = generate_tts_audio(text, job_id)
+        return (audio_url or None), metrics
+    except Exception as exc:
+        return None, {"server_tts_error": repr(exc)}
