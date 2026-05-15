@@ -108,9 +108,13 @@ GET  /agent/jobs
 GET  /agent/jobs/next?worker=pi
 GET  /agent/jobs/{job_id}
 POST /agent/jobs/{job_id}/result
+GET  /agent/jobs/{job_id}/logs    # Stick-forwarded debug logs + telemetry
+POST /agent/worker/heartbeat      # liveness from agent_worker; auto-fails stale in_progress jobs
 GET  /image/{job_id}
 GET  /audio/{job_id}
 ```
+
+The worker calls `/agent/worker/heartbeat` on every poll. If the server sees the worker go silent for >30s, any jobs stuck `in_progress` are marked `failed` so the UI can retry deliberately (re-queuing automatically would risk duplicating side effects). `scripts/run_worker.sh` wraps the worker in a crash-restart loop and writes timestamped output to `data/agent_worker.log`.
 
 Completed job response shape includes:
 
@@ -188,7 +192,10 @@ make test JS_RUNTIME=bun
 node scripts/test_pi_programmatic_start.mjs --prompt
 ```
 
-`make test` invokes Pi programmatically through the SDK directly from Node and through the same Python→Node SDK helper used by the worker, with discovery disabled and an in-memory session. It fails if startup exceeds `PI_STARTUP_THRESHOLD_MS` (default 5000 ms).
+`make test` invokes Pi programmatically through the SDK directly from Node and through the same Python→Node SDK helper used by the worker, with discovery disabled and an in-memory session. It fails if startup exceeds `PI_STARTUP_THRESHOLD_MS` (default 5000 ms). It also runs:
+
+- `make test-rle` — round-trip verification of `server.rle_compress` against `stick.st7789.rle_decompress` so the on-device decoder stays in sync with the server encoder.
+- `make test-staleness` — `_fail_stale_in_progress_jobs` correctness checks (stale-only recovery, malformed timestamps, mixed batches).
 
 Server-side sample upload:
 
