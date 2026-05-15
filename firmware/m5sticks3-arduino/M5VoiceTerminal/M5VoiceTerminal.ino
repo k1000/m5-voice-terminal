@@ -38,6 +38,80 @@ static constexpr uint8_t SPEAKER_VOLUME = 230;  // Keep <= ~230 on battery to av
 static uint32_t last_screen_activity_ms = 0;
 static bool screen_awake = true;
 
+// ─── Debug logging ────────────────────────────────────────────────────────────
+// When stickDebugMode is true, the Stick sends JSON log frames over the
+// existing WebSocket connection so the server (and thus the agent) can see
+// what is happening on-device.  Toggle with long-press of both BtnA + BtnB.
+static bool stickDebugMode = false;
+static String wsJobId = "";          // job_id for the current WS connection
+static uint32_t stickLogSeq = 0;    // monotonically increasing log sequence
+static uint32_t lastTelemetryMs = 0; // last time telemetry was sent (accessible from wsEventHandler)
+static constexpr uint32_t TELEMETRY_INTERVAL_MS = 5000;  // emit every 5 seconds
+
+// Send a debug log frame over WebSocket.  level: debug|info|warn|error
+// tag: short source identifier (max 8 chars).  msg: message text.
+// Only sends when stickDebugMode is true and wsClient is connected.
+static void stickLog(const char *level, const char *tag, const String &msg) {
+  if (!stickDebugMode || !wsJobConnected || !wsJobId.length()) return;
+  JsonDocument doc;
+  doc["_stick_log"] = true;
+  doc["level"] = level;
+  doc["tag"] = tag;
+  doc["msg"] = msg;
+  doc["seq"] = stickLogSeq++;
+  doc["ms"] = millis();
+  String out;
+  serializeJson(doc, out);
+  wsClient.sendTXT(out);
+}
+
+// ─── Telemetry: periodic health report ─────────────────────────────────────────
+// Gathers and sends a compact telemetry snapshot over the WS channel.
+// Sends a {"_stick_telemetry": true, ...} frame with health data.
+// Call from loop() whenever stickDebugMode is true.
+static void stickTelemetry() {
+  if (!stickDebugMode || !wsJobConnected || !wsJobId.length()) return;
+  uint32_t now = millis();
+  if (now - lastTelemetryMs < TELEMETRY_INTERVAL_MS) return;
+  lastTelemetryMs = now;
+
+  int batteryPct = M5.Power.getBatteryLevel();  // -1 = no battery / USB only
+  float batteryV = (batteryPct >= 0)
+                       ? M5.Power.Axp2101.getBatteryVoltage() : -1.0f;
+  uint32_t heapFree = ESP.getFreeHeap();
+  uint32_t heapTotal = ESP.getHeapSize();
+  size_t psramFree = 0, psramTotal = 0;
+  if (ESP.getPsramSize() > 0) {
+    psramFree = ESP.getFreePsram();
+    psramTotal = ESP.getPsramSize();
+  }
+  float tempC = temperatureRead();                     // internal sensor, non-calibrated
+  int wifiRssi = (WiFi.status() == WL_CONNECTED)
+                      ? WiFi.RSSI() : -999;            // dBm, -999 = disconnected
+
+  JsonDocument doc;
+  doc["_stick_telemetry"] = true;
+  doc["uptime_s"] = now / 1000;
+  doc["battery_pct"] = batteryPct;
+  doc["battery_v"] = batteryV;
+  doc["heap_free"] = heapFree;
+  doc["heap_total"] = heapTotal;
+  doc["psram_free"] = psramFree;
+  doc["psram_total"] = psramTotal;
+  doc["temp_c"] = tempC;
+  doc["wifi_rssi"] = wifiRssi;
+  doc["ms"] = now;
+  String out;
+  serializeJson(doc, out);
+  wsClient.sendTXT(out);
+}
+
+// Convenience macros — emit at key points in the flow.
+#define STICK_LOG_DEBUG(tag, msg)   stickLog("debug", tag, String(msg))
+#define STICK_LOG_INFO(tag, msg)    stickLog("info",  tag, String(msg))
+#define STICK_LOG_WARN(tag, msg)    stickLog("warn",  tag, String(msg))
+#define STICK_LOG_ERROR(tag, msg)   stickLog("error", tag, String(msg))
+
 static void wakeScreen() {
   if (!screen_awake) {
     M5.Display.setBrightness(SCREEN_BRIGHTNESS);
@@ -108,6 +182,12 @@ static void drawReady() {
   wakeScreen();
   M5.Display.clear(BLACK);
   drawFaceImage("neutral");
+  if (stickDebugMode) {
+    M5.Display.setTextSize(1);
+    M5.Display.setTextColor(GREEN, BLACK);
+    M5.Display.setCursor(M5.Display.width() - 28, 4);
+    M5.Display.print("DBG");
+  }
   M5.Display.setTextSize(2);
   M5.Display.setTextColor(WHITE, BLACK);
   drawWrapped("Hit it", 4, 142, 10, 18);
@@ -122,6 +202,49 @@ static void drawSentimentResponse(const String &sentimentInput, const String &li
   M5.Display.setTextSize(2);
   M5.Display.setTextColor(WHITE, BLACK);
   drawWrapped(line, 4, 142, 10, 18);
+}
+
+// ─── RLE Decompressor ─────────────────────────────────────────────────────────
+// Decodes the RLE\x01 format produced by server/app.py rle_compress().
+// Format: [0x52,0x4C,0x45,0x01] + encoded stream
+//   [count, lo, hi]     count >= 2  → repeat 16-bit pixel count times
+//   [0x00, N, lo, hi]  escape        → literal N copies of pixel
+//
+// Caller owns the returned pointer (ps_malloc'd).  Sets *outLen to byte count.
+static uint8_t *rleDecode(const uint8_t *data, int dataLen, int expectedPixels, int *outLen) {
+  *outLen = 0;
+  if (!data || dataLen < 4) return nullptr;
+  int offset = 0;
+  if (data[0] == 0x52 && data[1] == 0x4C && data[2] == 0x45 && data[3] == 0x01) {
+    offset = 4;  // skip RLE\x01 header
+  }
+  const int expectedBytes = expectedPixels * 2;
+  uint8_t *decoded = (uint8_t *)ps_malloc(expectedBytes);
+  if (!decoded) return nullptr;
+  int di = 0;
+  for (int i = offset; i < dataLen && di < expectedBytes; ) {
+    uint8_t count = data[i++];
+    if (count == 0x00) {
+      // Escape: literal single pixel.
+      count = data[i++];  // should be 1
+      uint8_t lo = data[i++];
+      uint8_t hi = data[i++];
+      for (uint8_t k = 0; k < count && di < expectedBytes; k++) {
+        decoded[di++] = lo;
+        decoded[di++] = hi;
+      }
+    } else {
+      // Repeat run.
+      uint8_t lo = data[i++];
+      uint8_t hi = data[i++];
+      for (uint8_t k = 0; k < count && di < expectedBytes; k++) {
+        decoded[di++] = lo;
+        decoded[di++] = hi;
+      }
+    }
+  }
+  *outLen = di;
+  return decoded;
 }
 
 static bool drawRemoteImageUrl(const String &imageUrl, const String &line = "") {
@@ -158,46 +281,12 @@ static bool drawRemoteImageUrl(const String &imageUrl, const String &line = "") 
   }
   http.end();
 
-  // Check for RLE header.  If present, decode in-place into a local buffer.
-  uint8_t *pixels = raw;
-  bool do_free_pixels = false;
-  if (downloaded >= 4 && raw[0] == 0x52 && raw[1] == 0x4C && raw[2] == 0x45 && raw[3] == 0x01) {
-    uint8_t *decoded = (uint8_t *)ps_malloc(expected);
-    if (!decoded) {
-      free(raw);
-      return false;
-    }
-    int di = 0;
-    for (int i = 4; i < downloaded && di < expected; ) {
-      uint8_t count = raw[i++];
-      if (count == 0x00) {
-        // Escape: [0x00, N, lo, hi] — write N copies of the pixel.
-        count = raw[i++];  // should be 1
-        uint8_t lo = raw[i++];
-        uint8_t hi = raw[i++];
-        for (uint8_t k = 0; k < count && di < expected; k++) {
-          decoded[di++] = lo;
-          decoded[di++] = hi;
-        }
-      } else {
-        // Repeat: [count, lo, hi] — repeat the pixel count times.
-        uint8_t lo = raw[i++];
-        uint8_t hi = raw[i++];
-        for (uint8_t k = 0; k < count && di < expected; k++) {
-          decoded[di++] = lo;
-          decoded[di++] = hi;
-        }
-      }
-    }
-    pixels = decoded;
-    do_free_pixels = true;
-    free(raw);
-    if (di != expected) {
-      free(decoded);
-      return false;
-    }
-  } else if (downloaded != expected) {
-    free(raw);
+  // Decode via shared helper.
+  int decodedLen = 0;
+  uint8_t *pixels = rleDecode(raw, downloaded, expected, &decodedLen);
+  free(raw);
+  if (!pixels || decodedLen != expected) {
+    if (pixels) free(pixels);
     return false;
   }
 
@@ -207,8 +296,7 @@ static bool drawRemoteImageUrl(const String &imageUrl, const String &line = "") 
   M5.Display.setSwapBytes(true);
   M5.Display.pushImage(0, 0, WOLF_FACE_WIDTH, WOLF_FACE_HEIGHT, (uint16_t *)pixels);
   M5.Display.setSwapBytes(oldSwap);
-  if (do_free_pixels) free(pixels);
-  else free(raw);
+  free(pixels);
   M5.Display.setTextSize(2);
   M5.Display.setTextColor(WHITE, BLACK);
   drawWrapped(line, 4, 142, 10, 18);
@@ -217,6 +305,15 @@ static bool drawRemoteImageUrl(const String &imageUrl, const String &line = "") 
 
 static void drawJobResponse(const String &sentiment, const String &line, const String &imageUrl) {
   if (imageUrl.length() && drawRemoteImageUrl(imageUrl, line)) return;
+  // If image was already displayed via WS binary frame, just draw text on top.
+  // Skip drawSentimentResponse which calls clear(BLACK) and would wipe the image.
+  if (wsBinaryDisplayed) {
+    wakeScreen();
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(WHITE, BLACK);
+    drawWrapped(line, 4, wsImageH + 4, 10, 18);
+    return;
+  }
   drawSentimentResponse(sentiment, line);
 }
 
@@ -267,9 +364,13 @@ static void wsEventHandler(WStype_t type, uint8_t *payload, size_t length) {
     case WStype_CONNECTED:
       wsJobConnected = true;
       wsLastActivityMs = millis();
+      STICK_LOG_INFO("WS", "connected " + wsJobId);
+      lastTelemetryMs = 0;  // force telemetry snapshot on connect
+      stickTelemetry();
       break;
     case WStype_DISCONNECTED:
       wsJobConnected = false;
+      STICK_LOG_INFO("WS", "disconnected");
       if (!wsJobDone) {
         wsJobDone = true;
         wsJobSuccess = false;
@@ -291,26 +392,33 @@ static void wsEventHandler(WStype_t type, uint8_t *payload, size_t length) {
       }
       break;
     }
-    case WStype_BIN:
-      // Binary frame: raw RGB565 image pushed directly from server over WebSocket.
+    case WStype_BIN: {
+      // Binary frame: RLE-compressed or raw RGB565 image from server over WebSocket.
       // wsImageW/H were set from the JSON metadata sent just before this frame.
       wsLastActivityMs = millis();
-      if (length == (size_t)(wsImageW * wsImageH * 2)) {
-        wsBinaryDisplayed = true;
-        wakeScreen();
-        M5.Display.clear(BLACK);
-        bool oldSwap = M5.Display.getSwapBytes();
-        M5.Display.setSwapBytes(true);
-        M5.Display.pushImage(0, 0, wsImageW, wsImageH, (uint16_t *)payload);
-        M5.Display.setSwapBytes(oldSwap);
-        if (wsJobDoc.containsKey("result_text")) {
-          String result = wsJobDoc["result_text"].as<String>();
-          M5.Display.setTextSize(2);
-          M5.Display.setTextColor(WHITE, BLACK);
-          drawWrapped(result, 4, wsImageH + 4, 10, 18);
-        }
+      const int expectedBytes = wsImageW * wsImageH * 2;
+      int decodedLen = 0;
+      uint8_t *pixels = rleDecode(payload, length, wsImageW * wsImageH, &decodedLen);
+      if (!pixels || decodedLen != expectedBytes) {
+        if (pixels) free(pixels);
+        break;
+      }
+      wsBinaryDisplayed = true;
+      wakeScreen();
+      M5.Display.clear(BLACK);
+      bool oldSwap = M5.Display.getSwapBytes();
+      M5.Display.setSwapBytes(true);
+      M5.Display.pushImage(0, 0, wsImageW, wsImageH, (uint16_t *)pixels);
+      M5.Display.setSwapBytes(oldSwap);
+      free(pixels);
+      if (wsJobDoc.containsKey("result_text")) {
+        String result = wsJobDoc["result_text"].as<String>();
+        M5.Display.setTextSize(2);
+        M5.Display.setTextColor(WHITE, BLACK);
+        drawWrapped(result, 4, wsImageH + 4, 10, 18);
       }
       break;
+    }
     case WStype_PONG:
       wsLastActivityMs = millis();
       break;
@@ -503,6 +611,7 @@ static bool streamJobResult(const String &jobId) {
   uint16_t port = 8010;
   if (!parseHostPort(SERVER_BASE_URL, host, port)) {
     drawStatus("WS parse", SERVER_BASE_URL);
+    STICK_LOG_ERROR("WS", "url parse failed: " + SERVER_BASE_URL);
     return false;
   }
 
@@ -513,6 +622,9 @@ static bool streamJobResult(const String &jobId) {
   wsLastActivityMs = millis();
   wsBinaryDisplayed = false;
   wsJobDoc.clear();
+  wsJobId = jobId;
+  stickLogSeq = 0;
+  STICK_LOG_INFO("WS", "connecting job=" + jobId);
 
   wsClient.disconnect();
   wsClient.onEvent(wsEventHandler);
@@ -522,6 +634,8 @@ static bool streamJobResult(const String &jobId) {
   const char spin[] = {'|', '/', '-', '\\'};
   uint32_t i = 0;
   uint32_t lastPingMs = millis();
+  uint32_t lastWaitDrawMs = 0;
+  int lastWaitFaceFrame = -1;
 
   while (!wsJobDone && millis() - wsLastActivityMs < WS_TIMEOUT_MS) {
     wsClient.loop();
@@ -535,33 +649,44 @@ static bool streamJobResult(const String &jobId) {
       }
 
       // Animate waiting face only if binary image hasn't arrived yet.
-      // When wsEventHandler receives binary, it writes directly to display.
+      // Throttle redraws: clearing/redrawing every 20ms causes visible blink.
+      // Redraw only when spinner/face frame changes (~4 FPS).
       if (!wsBinaryDisplayed) {
-        uint32_t elapsed = millis() - wsLastActivityMs + 1;
-        wakeScreen();
-        M5.Display.clear(BLACK);
-        drawFaceImage((elapsed / 3000) % 2 == 0 ? "waiting-left" : "waiting-right");
-        M5.Display.setTextSize(2);
-        M5.Display.setTextColor(YELLOW, BLACK);
-        drawWrapped(String("Listening ") + spin[i++ % 4], 4, 142, 10, 18);
-        M5.Display.setTextSize(1);
-        M5.Display.setTextColor(WHITE, BLACK);
-        drawWrapped("Job " + jobId, 4, 200, 18, 12);
+        uint32_t nowMs = millis();
+        int faceFrame = (nowMs / 3000) % 2;
+        if (nowMs - lastWaitDrawMs >= 250 || faceFrame != lastWaitFaceFrame) {
+          lastWaitDrawMs = nowMs;
+          lastWaitFaceFrame = faceFrame;
+          wakeScreen();
+          M5.Display.clear(BLACK);
+          drawFaceImage(faceFrame == 0 ? "waiting-left" : "waiting-right");
+          M5.Display.setTextSize(2);
+          M5.Display.setTextColor(YELLOW, BLACK);
+          drawWrapped(String("Listening ") + spin[i++ % 4], 4, 142, 10, 18);
+          M5.Display.setTextSize(1);
+          M5.Display.setTextColor(WHITE, BLACK);
+          drawWrapped("Job " + jobId, 4, 200, 18, 12);
+        }
       }
     }
     delay(20);
   }
 
   wsClient.disconnect();
+  STICK_LOG_INFO("WS", "loop done wsJobDone");
 
   if (!wsJobDone) {
+    STICK_LOG_ERROR("WS", "timeout after 120s");
     drawStatus("WS timeout", "Job " + jobId);
+    wsJobId = "";
     return false;
   }
 
   if (!wsJobSuccess) {
     String error = wsJobDoc["error"] | "agent failed";
+    STICK_LOG_ERROR("JOB", "failed: " + error);
     drawSentimentResponse("sad", error);
+    wsJobId = "";
     return false;
   }
 
@@ -574,12 +699,18 @@ static bool streamJobResult(const String &jobId) {
   // imageUrl is deliberately omitted when wsBinaryDisplayed to avoid re-fetch.
   String displayImageUrl = wsBinaryDisplayed ? String("") : (wsJobDoc["image_url"] | String(""));
 
+  STICK_LOG_INFO("JOB", "done sentiment=" + sentiment + " img=" + (wsBinaryDisplayed ? "ws" : displayImageUrl.length() ? "http" : "none"));
+
   drawJobResponse(sentiment, result, displayImageUrl);
   if (audioUrl.length()) {
     delay(700);
+    STICK_LOG_INFO("AUDIO", "playing " + audioUrl);
     playAudioUrl(audioUrl);
+    STICK_LOG_INFO("AUDIO", "done");
     drawJobResponse(sentiment, result, displayImageUrl);
   }
+
+  wsJobId = "";
 
   JsonArray options = wsJobDoc["options"].as<JsonArray>();
   String selected = chooseOption(options);
@@ -589,6 +720,7 @@ static bool streamJobResult(const String &jobId) {
       return true;
     }
     drawStatus("Selected", selected);
+    STICK_LOG_INFO("MENU", "selected: " + selected);
     String response = postTextCommand(selected);
     String nextJob = extractJobId(response);
     if (nextJob.length()) {
@@ -677,7 +809,7 @@ static bool pollJobResult(const String &jobId) {
   drawStatus("Timeout", "Job " + jobId);
   return false;
 #else
-  drawStatus("Poll disabled", "WS only");
+  (void)jobId;  // unused without polling
   return false;
 #endif
 }
@@ -759,11 +891,41 @@ void setup() {
     while (true) delay(1000);
   }
   connectWiFi();
+  STICK_LOG_INFO("SYS", "setup done");
   drawReady();
+}
+
+// Toggle debug mode when both buttons are held for 3 seconds.
+static void checkDebugToggle() {
+  static uint32_t bothHeldSince = 0;
+  if (M5.BtnA.isPressed() && M5.BtnB.isPressed()) {
+    if (bothHeldSince == 0) bothHeldSince = millis();
+    if (millis() - bothHeldSince >= 3000) {
+      stickDebugMode = !stickDebugMode;
+      bothHeldSince = 0;
+      wakeScreen();
+      M5.Display.clear(BLACK);
+      M5.Display.setTextSize(2);
+      M5.Display.setTextColor(stickDebugMode ? GREEN : RED, BLACK);
+      M5.Display.setCursor(4, 40);
+      M5.Display.print(stickDebugMode ? "DEBUG ON" : "DEBUG OFF");
+      M5.Display.setTextSize(1);
+      M5.Display.setTextColor(WHITE, BLACK);
+      M5.Display.setCursor(4, 70);
+      M5.Display.print("Hold both 3s to toggle");
+      delay(1500);
+      drawReady();
+    }
+  } else {
+    bothHeldSince = 0;
+  }
 }
 
 void loop() {
   M5.update();
+  checkDebugToggle();
+  stickTelemetry();  // sends periodic telemetry every TELEMETRY_INTERVAL_MS when debug mode is on
+
   if (!screen_awake && (M5.BtnA.wasPressed() || M5.BtnB.wasPressed())) {
     wakeScreen();
     drawReady();
@@ -777,12 +939,18 @@ void loop() {
     }
     // Debounce and let the user hold BtnA to talk.
     delay(80);
+    // Emit telemetry snapshot right before recording starts.
+    lastTelemetryMs = 0;  // force immediate telemetry on next loop
+    stickTelemetry();
     if (recordAudioWhileHeld()) {
+      STICK_LOG_INFO("MIC", "recorded " + String(recorded_samples) + " samples");
       String response = postAudio();
       String jobId = extractJobId(response);
       if (jobId.length()) {
+        STICK_LOG_INFO("HTTP", "queued job=" + jobId);
         drawStatus("Queued", "Job " + jobId);
         if (!streamJobResult(jobId)) {
+          STICK_LOG_WARN("WS", "falling back to polling");
           // Fall back to polling if WebSocket stream fails.
           pollJobResult(jobId);
         }

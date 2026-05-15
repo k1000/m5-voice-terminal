@@ -45,6 +45,15 @@ _subscribers_lock = asyncio.Lock()
 # thread and consumed + cleared by _notify_subscribers.
 _pending_image_bin: dict[str, bytes] = {}
 _pending_image_lock = Lock()
+# Stick-side debug logs forwarded over WebSocket, keyed by job_id.
+_stick_logs: dict[str, list[dict[str, Any]]] = {}
+_stick_logs_lock = Lock()
+# Stick-side telemetry snapshots (periodic health data), keyed by job_id.
+_stick_telemetry: dict[str, list[dict[str, Any]]] = {}
+_stick_telemetry_lock = Lock()
+# Agent worker heartbeat: unix timestamp of last heartbeat received from the worker.
+_worker_last_seen: float = 0.0
+_worker_last_seen_lock = Lock()
 # Shared thread pool for parallel image + audio generation.
 _tp_executor: ThreadPoolExecutor | None = None
 
@@ -827,6 +836,30 @@ async def websocket_job_status(websocket: WebSocket, job_id: str) -> None:
                 await websocket.send_text("pong")
             elif '"_ws_close"' in data:
                 break
+            # Stick-side debug log forwarded over the same WebSocket connection.
+            # Format: {"_stick_log": true, "level": "debug|info|warn|error",
+            #          "tag": "...", "msg": "...", "seq": 1, "ms": 1234}
+            elif '"_stick_log"' in data:
+                try:
+                    entry = json.loads(data)
+                    entry["ts"] = utc_now()
+                    with _stick_logs_lock:
+                        _stick_logs.setdefault(job_id, []).append(entry)
+                except Exception as exc:
+                    print(f"[ws] bad stick log frame: {exc!r}", flush=True)
+            # Stick-side telemetry snapshot: periodic health report.
+            # Format: {"_stick_telemetry": true, "uptime_s": 42, "battery_pct": 85,
+            #          "battery_v": 4.1, "heap_free": 123456, "heap_total": 299008,
+            #          "psram_free": 0, "psram_total": 0, "temp_c": 45.2,
+            #          "wifi_rssi": -55, "ms": 42000}
+            elif '"_stick_telemetry"' in data:
+                try:
+                    entry = json.loads(data)
+                    entry["ts"] = utc_now()
+                    with _stick_telemetry_lock:
+                        _stick_telemetry.setdefault(job_id, []).append(entry)
+                except Exception as exc:
+                    print(f"[ws] bad stick telemetry frame: {exc!r}", flush=True)
     except WebSocketDisconnect:
         pass
     finally:
@@ -848,6 +881,146 @@ def get_agent_job(job_id: str) -> AgentJob:
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
     return job
+
+
+class StickLogEntry(BaseModel):
+    level: str
+    tag: str
+    msg: str
+    seq: int
+    ms: int
+    ts: str
+
+
+class StickTelemetryEntry(BaseModel):
+    uptime_s: int
+    battery_pct: int
+    battery_v: float
+    heap_free: int
+    heap_total: int
+    psram_free: int
+    psram_total: int
+    temp_c: float
+    wifi_rssi: int
+    ms: int
+    ts: str
+
+
+class StickLogList(BaseModel):
+    job_id: str
+    logs: list[StickLogEntry]
+    telemetry: list[StickTelemetryEntry]
+
+
+@app.get("/agent/jobs/{job_id}/logs", response_model=StickLogList)
+def get_stick_logs(job_id: str) -> StickLogList:
+    """Return all Stick-side debug logs and telemetry forwarded over WebSocket for a job."""
+    with _stick_logs_lock:
+        logs = list(_stick_logs.get(job_id, []))
+    with _stick_telemetry_lock:
+        telemetry = list(_stick_telemetry.get(job_id, []))
+    return StickLogList(job_id=job_id, logs=logs, telemetry=telemetry)
+
+
+# ─── Agent worker heartbeat ────────────────────────────────────────────────────
+
+HEARTBEAT_INTERVAL_S = 10          # worker sends heartbeat every poll cycle
+STALENESS_THRESHOLD_S = 30         # worker considered dead after this silence
+STALENESS_CHECK_INTERVAL_S = 15    # how often the background task checks
+
+
+@app.post("/agent/worker/heartbeat")
+def worker_heartbeat() -> dict[str, Any]:
+    """Called by the agent worker on each poll cycle. Keeps the server's
+    staleness detector alive.
+
+    If the worker has been silent for more than STALENESS_THRESHOLD_S, any
+    jobs stuck in_progress are marked failed so the UI/caller can decide
+    whether to re-queue (re-queuing automatically could duplicate side effects).
+    """
+    global _worker_last_seen
+    now = time.monotonic()
+    with _worker_last_seen_lock:
+        prev = _worker_last_seen
+        _worker_last_seen = now
+
+    recovered = 0
+    # First heartbeat (prev == 0 means server just started) or gap > threshold
+    # both indicate the worker may have missed jobs — run recovery.
+    if prev == 0.0 or (now - prev) > STALENESS_THRESHOLD_S:
+        with _jobs_lock:
+            recovered = _fail_stale_in_progress_jobs()
+
+    return {
+        "ok": True,
+        "ts": now,
+        "recovered_jobs": recovered,
+    }
+
+
+def _fail_stale_in_progress_jobs() -> int:
+    """Mark in_progress jobs as failed if the agent worker has been absent.
+
+    Runs under _jobs_lock. Returns the number of jobs recovered.
+    """
+    now = time.time()
+    recovered = 0
+    jobs = _load_jobs_unlocked()
+    changed = False
+    for index, job in enumerate(jobs):
+        if job.status == "in_progress":
+            try:
+                age = now - datetime.fromisoformat(job.updated_at).timestamp()
+            except ValueError:
+                age = STALENESS_THRESHOLD_S + 1
+            if age >= STALENESS_THRESHOLD_S:
+                job.status = "failed"
+                job.error = "agent worker was unreachable"
+                job.updated_at = utc_now()
+                jobs[index] = job
+                recovered += 1
+                changed = True
+    if changed:
+        _save_jobs_unlocked(jobs)
+    return recovered
+
+
+def _run_staleness_checker() -> None:
+    """Background thread: periodically checks for worker staleness and recovers
+    any jobs stuck in_progress.
+    """
+    while True:
+        time.sleep(STALENESS_CHECK_INTERVAL_S)
+        try:
+            with _worker_last_seen_lock:
+                last_seen = _worker_last_seen
+            now = time.monotonic()
+            if last_seen > 0 and (now - last_seen) > STALENESS_THRESHOLD_S:
+                with _jobs_lock:
+                    recovered = _fail_stale_in_progress_jobs()
+                if recovered:
+                    print(f"[staleness] worker silent {int(now - last_seen)}s, "
+                          f"recovered {recovered} stuck job(s)", flush=True)
+        except Exception as exc:
+            print(f"[staleness] checker error: {exc!r}", flush=True)
+
+
+# Start staleness checker on module load.
+Thread(target=_run_staleness_checker, daemon=True, name="staleness-checker").start()
+
+
+@app.on_event("startup")
+async def _on_startup() -> None:
+    """Fail any jobs that were left in_progress before a prior server shutdown.
+
+    These are jobs the agent worker was actively processing when the server died.
+    Resetting them to failed lets the recovering worker (or a new one) pick them up
+    on the next poll cycle without waiting for a timeout.
+    """
+    with _jobs_lock:
+        recovered = _fail_stale_in_progress_jobs()
+    if recovered:
+        print(f"[startup] recovered {recovered} stale in_progress job(s)", flush=True)
 
 
 @app.post("/agent/jobs/{job_id}/result", response_model=AgentJob)
@@ -897,7 +1070,8 @@ def set_agent_job_result(job_id: str, result: AgentResult, background_tasks: Bac
                 job.options = normalize_options(result.options)
                 job.metrics.update(result.metrics)
                 if pending_bin is not None:
-                    job.metrics["server_image_format"] = "rgb565-le"
+                    is_rle = pending_bin[:4] == b"RLE\x01"
+                    job.metrics["server_image_format"] = "rgb565-le-rle" if is_rle else "rgb565-le"
                     job.metrics["server_image_pushed_ws"] = True
                     job.metrics["server_image_bytes"] = len(pending_bin)
                 if has_image:
@@ -921,10 +1095,10 @@ def set_agent_job_result(job_id: str, result: AgentResult, background_tasks: Bac
 
 
 def _generate_image_for_job(job_id: str, image_prompt: str) -> bytes | None:
-    """Generate image synchronously in a thread.  Returns raw RGB565 bytes or None.
+    """Generate image synchronously in a thread.  Returns RLE-compressed bytes (with header) or None.
 
-    RLE-compressed images are decompressed before returning so the Stick can
-    push them directly to the display without needing RLE decoding logic.
+    Sends RLE-compressed data as-is so the Stick receives ~10-15 KB instead of 36 KB.
+    The Stick decompresses on-device using its RLE decoder.
     """
     # Always prefix with pixel-art style so AI images match the retro aesthetic.
     styled_prompt = f"pixel art {image_prompt}, old arcade style, 1990s computer graphics"
@@ -933,11 +1107,9 @@ def _generate_image_for_job(job_id: str, image_prompt: str) -> bytes | None:
         rgb565_path = IMAGE_DIR / f"{job_id}.rgb565"
         if not rgb565_path.exists():
             return None
-        data = rgb565_path.read_bytes()
-        # Decompress RLE if present; return as-is if already raw.
-        if data[:4] == b"RLE\x01":
-            data = rle_decompress(data[4:])
-        return bytes(data)
+        # Send RLE-compressed if available; raw RGB565 otherwise.
+        # Stick checks for b"RLE\x01" header to detect compressed data.
+        return rgb565_path.read_bytes()
     except Exception:
         return None
 

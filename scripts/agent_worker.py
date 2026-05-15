@@ -66,6 +66,14 @@ def complete(base_url: str, job_id: str, text: str, status: str = "done", error:
     request_json("POST", f"{base_url}/agent/jobs/{job_id}/result", payload, timeout=180)
 
 
+def heartbeat(base_url: str) -> None:
+    """Tell the server we are alive. Idempotent — server ignores errors."""
+    try:
+        request_json("POST", f"{base_url}/agent/worker/heartbeat", timeout=5)
+    except Exception:
+        pass  # heartbeat is best-effort; don't let it interrupt polling
+
+
 def normalize_options(options: Any) -> list[str]:
     if not isinstance(options, list):
         return []
@@ -266,12 +274,14 @@ def main() -> None:
     base_url = args.base_url.rstrip("/")
 
     print(f"agent_worker listening on {base_url}", flush=True)
+    heartbeat(base_url)  # announce immediately so server knows we're up
     while True:
         try:
             job = next_queued_job(base_url)
             if job is None:
                 if args.once:
                     return
+                heartbeat(base_url)  # tell server we are alive
                 time.sleep(args.interval)
                 continue
 

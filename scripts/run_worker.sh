@@ -16,11 +16,6 @@ if [ -f .env ]; then
   set +a
 fi
 
-if [ ! -d .venv ]; then
-  echo "Missing .venv. Run: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt" >&2
-  exit 1
-fi
-
 if [ -z "${PI_JS_RUNTIME:-}" ] && command -v bun >/dev/null 2>&1; then
   export PI_JS_RUNTIME=bun
 fi
@@ -30,4 +25,17 @@ export PI_WORKER_MODEL="${PI_WORKER_MODEL:-minimax/MiniMax-M2.7-highspeed}"
 export PI_WORKER_THINKING="${PI_WORKER_THINKING:-off}"
 export BASE_URL="${BASE_URL:-http://127.0.0.1:8010}"
 
-exec .venv/bin/python scripts/agent_worker.py --base-url "$BASE_URL"
+# Auto-restart loop: worker dies → reconnect loop.  Ctrl-C exits cleanly.
+echo "agent_worker auto-restart loop PID $$ "$(date)"" >&2
+while true; do
+  python3 scripts/agent_worker.py --base-url "$BASE_URL" 2>&1 \
+    | while IFS= read -r line; do echo "$(date +%H:%M:%S) $line"; done \
+    >> data/agent_worker.log
+  EXIT=${PIPESTATUS[0]}
+  if [ $EXIT -eq 0 ] || [ $EXIT -eq 130 ]; then
+    echo "agent_worker exited cleanly (code $EXIT)" >&2
+    break
+  fi
+  echo "agent_worker crashed (code $EXIT), restarting in 2s..." >&2
+  sleep 2
+done

@@ -244,3 +244,71 @@ class ST7789:
 def sticks3_display(rotation=0, baudrate=40_000_000):
     """Construct an ST7789 with M5StickS3 pins."""
     return ST7789(rotation=rotation, baudrate=baudrate)
+
+
+# ─── RLE Decompressor ────────────────────────────────────────────────────────
+# Decodes the RLE\x01 format produced by server/app.py rle_compress().
+# Format: b"RLE\x01" + encoded stream
+#   [count, lo, hi]      count >= 2  → repeat 16-bit pixel (hi<<8|lo) count times
+#   [0x00, 1, lo, hi]   escape       → literal single pixel
+
+def rle_decompress(data, width, height):
+    """Decompress RLE\x01 data into a flat bytearray of RGB565 pixels (little-endian).
+
+    Args:
+        data: bytes with b"RLE\x01" prefix followed by encoded stream
+        width: image width in pixels
+        height: image height in pixels
+
+    Returns:
+        bytearray of (width * height * 2) bytes in RGB565 LE order
+    """
+    expected_len = width * height * 2
+    out = bytearray(expected_len)
+    out_idx = 0
+
+    # Skip RLE\x01 header if present.
+    if data[:4] == b"RLE\x01":
+        data = data[4:]
+
+    i = 0
+    data_len = len(data)
+    while i < data_len and out_idx < expected_len:
+        count = data[i]
+        i += 1
+        if count == 0:
+            # Escape: literal single pixel. Next byte is count (always 1).
+            literal_count = data[i]
+            i += 1
+            for _ in range(literal_count):
+                if out_idx >= expected_len:
+                    break
+                lo = data[i]
+                hi = data[i + 1]
+                i += 2
+                out[out_idx] = lo
+                out[out_idx + 1] = hi
+                out_idx += 2
+        else:
+            # Repeat run: next 2 bytes are the pixel (lo, hi).
+            lo = data[i]
+            hi = data[i + 1]
+            i += 2
+            for _ in range(count):
+                if out_idx >= expected_len:
+                    break
+                out[out_idx] = lo
+                out[out_idx + 1] = hi
+                out_idx += 2
+
+    return out[:out_idx]  # trim if overproduced
+
+
+def blit_rle(display, data, x=0, y=0, width=135, height=135):
+    """Decompress RLE data and blit it to the display at (x, y).
+
+    Works for both RLE-compressed (b"RLE\x01" header) and raw RGB565 data.
+    """
+    pixels = rle_decompress(data, width, height) if data[:4] == b"RLE\x01" else bytearray(data[:width * height * 2])
+    display.set_window(x, y, x + width - 1, y + height - 1)
+    display.write_pixels(pixels)
